@@ -45,7 +45,7 @@ def parse_usd_all(text: str) -> List[float]:
     for m in USD_RE.finditer(text or ""):
         try: vals.append(float(m.group(1).replace(",", "")))
         except: pass
-    return [v for v in vals if v > 0]  # 0달러/노이즈 제거
+    return [v for v in vals if v > 0]
 
 def fmt_currency_usd(v) -> str:
     try:
@@ -80,19 +80,6 @@ def canonical_amz_link(href: str, fallback_asin: str = "") -> str:
     if m: return f"https://www.amazon.com/dp/{m.group(1)}"
     return href or (f"https://www.amazon.com/dp/{fallback_asin}" if fallback_asin else "")
 
-def nearest_text_block(el):
-    """가격/브랜드 탐색용: 컨테이너 텍스트"""
-    txt = ""
-    cur = el
-    for _ in range(4):
-        if cur is None: break
-        try:
-            txt = clean_text(cur.get_text(" ", strip=True))
-            if len(txt) >= 20: break
-        except: pass
-        cur = cur.parent
-    return txt
-
 def extract_brand_from_container(c, title_text: str) -> str:
     # 1) 브랜드 스토어 링크
     for a in c.select("a[href]"):
@@ -108,24 +95,18 @@ def extract_brand_from_container(c, title_text: str) -> str:
         cand = clean_text(m.group(1))
         if cand and len(cand) <= 40:
             return cand
-    # 3) 제목 선두에서 보수적으로 추정 (공백 단어 1~2개)
+    # 3) 제목 선두 보수적 추정
     title = clean_text(title_text or "")
     words = title.split()
     if not words: return ""
-    if len(words[0]) <= 3 and len(words) >= 2:
-        guess = f"{words[0]} {words[1]}"
-    else:
-        guess = words[0]
-    # 너무 흔한 단어/숫자 시작 제외
+    guess = (words[0] + (" " + words[1] if len(words[0]) <= 3 and len(words) >= 2 else ""))
     if any(ch.isdigit() for ch in guess) or guess.lower() in ("the","this","new","best","top"):
         return ""
     return guess[:40]
 
-# ----------------- 정적 파싱 (data-asin 기준, 50개 보장 시도) -----------------
+# ----------------- 정적 파싱 (data-asin 기준, 50개 목표) -----------------
 def parse_http(html: str, offset: int) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
-
-    # 상품 카드 컨테이너: data-asin 보유
     containers = soup.select("[data-asin]:not([data-asin=''])")
     items: List[Product] = []
     seen = set()
@@ -135,7 +116,6 @@ def parse_http(html: str, offset: int) -> List[Product]:
         if not asin or asin in seen:
             continue
 
-        # 링크/제목
         a = c.select_one("a[href*='/dp/']") or c.select_one("a.a-link-normal[href]")
         href = a.get("href") if a else ""
         link = canonical_amz_link(href or "", fallback_asin=asin)
@@ -152,15 +132,12 @@ def parse_http(html: str, offset: int) -> List[Product]:
         if not title:
             continue
 
-        # 브랜드
         brand = extract_brand_from_container(c, title)
 
-        # 가격
         block = clean_text(c.get_text(" ", strip=True))
         prices = parse_usd_all(block)
         sale = orig = None
-        if len(prices) == 1:
-            sale = prices[0]
+        if len(prices) == 1: sale = prices[0]
         elif len(prices) >= 2:
             sale, orig = min(prices), max(prices)
             if sale == orig: orig = None
@@ -176,7 +153,7 @@ def parse_http(html: str, offset: int) -> List[Product]:
             asin=asin
         ))
         seen.add(asin)
-        if len(items) >= 50:  # 페이지당 50개 보장
+        if len(items) >= 50:
             break
 
     return items
@@ -207,8 +184,7 @@ def fetch_by_http() -> List[Product]:
             except Exception as e:
                 last_err = e
                 time.sleep(1.5 * (attempt + 1))
-        # 첫 페이지에서 40개 미만이면 폴백으로 넘김
-        if last_err and len(all_items) < (idx * 50 + 40):
+        if last_err and len(all_items) < (idx * 50 + 30):
             raise last_err
     return all_items
 
@@ -216,13 +192,6 @@ def fetch_by_http() -> List[Product]:
 def fetch_page_playwright(url: str, offset: int) -> List[Product]:
     from playwright.sync_api import sync_playwright
     import pathlib
-
-    def _dump(page, tag):
-        pathlib.Path("data/debug").mkdir(parents=True, exist_ok=True)
-        with open(f"data/debug/amazon_{tag}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-        try: page.screenshot(path=f"data/debug/amazon_{tag}.png", full_page=True)
-        except: pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -242,22 +211,19 @@ def fetch_page_playwright(url: str, offset: int) -> List[Product]:
         try: page.wait_for_load_state("networkidle", timeout=30_000)
         except: pass
 
-        # 쿠키/동의 모달 닫기
         for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
             try: page.locator(sel).first.click(timeout=1200)
             except: pass
 
-        # 충분히 로드될 때까지 스크롤 (cards 수 기준)
-        for _ in range(18):
+        # 천천히 스크롤하며 카드 수 확보
+        for _ in range(22):
             cnt = page.eval_on_selector_all("[data-asin]:not([data-asin=''])", "els => els.length")
             if cnt and cnt >= 60: break
             try: page.mouse.wheel(0, 1600)
             except: pass
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(600)
 
-        # 캡차 방어
         if "captcha" in (page.url or "").lower():
-            _dump(page, f"captcha_{offset}")
             ctx.close(); browser.close()
             return []
 
@@ -297,7 +263,6 @@ def fetch_page_playwright(url: str, offset: int) -> List[Product]:
                 }
                 if(!title) continue;
 
-                // 브랜드: /stores/ 링크 → "by Brand" → 제목 추정
                 let brand = '';
                 const storeA = c.querySelector("a[href*='/stores/']:not([href*='/dp/'])");
                 if(storeA){
@@ -307,7 +272,7 @@ def fetch_page_playwright(url: str, offset: int) -> List[Product]:
                 if(!brand){
                   const block = text(c);
                   const m = block.match(byBrandRe);
-                  if(m) brand = m[1].replace(/\\s+/g,' ').trim();
+                  if(m) brand = (m[1]||'').replace(/\\s+/g,' ').trim();
                 }
                 if(!brand){
                   const words = title.split(' ');
@@ -364,7 +329,7 @@ def fetch_by_playwright() -> List[Product]:
 def fetch_products() -> List[Product]:
     try:
         items = fetch_by_http()
-        if len(items) >= 80:  # 50+50에 여유치
+        if len(items) >= 80:  # 기대치
             return items[:100]
     except Exception as e:
         print("[HTTP 오류] → Playwright 폴백:", e)
@@ -449,11 +414,9 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
-    # TOP10
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
     for _, r in top10.iterrows():
         name = clean_text(r["product_name"])
-        # 브랜드가 있고 제품명이 브랜드로 시작하지 않으면 앞에 붙여줌
         br = clean_text(r.get("brand",""))
         if br and not name.lower().startswith(br.lower()):
             name_show = f"{br} {name}"
@@ -467,7 +430,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     if df_prev is None or not len(df_prev):
         return S
 
-    # 키: ASIN 우선, 없으면 URL
     df_t = df_today.copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
     df_t.set_index("key", inplace=True)
@@ -483,7 +445,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     new    = set(t30.index) - set(p30.index)
     out    = set(p30.index) - set(t30.index)
 
-    # 급상승(3)
     rising = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -494,7 +455,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     rising.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["rising"] = [x[-1] for x in rising[:3]]
 
-    # 뉴랭커(≤3)
     newcomers = []
     for k in new:
         cr = int(t30.loc[k,"rank"])
@@ -503,7 +463,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
-    # 급하락(5)
     falling = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -514,7 +473,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["falling"] = [x[-1] for x in falling[:5]]
 
-    # OUT
     for k in sorted(list(out)):
         pr = int(p30.loc[k,"rank"])
         nm = slack_escape(clean_text(p30.loc[k]["product_name"]))
@@ -523,14 +481,16 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     S["inout_count"] = len(new) + len(out)
     return S
 
-def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
-    lines: List[str] = []
-    lines.append(f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*")
-    lines.append("")
-    lines.append("*TOP 10*");          lines.extend(S.get("top10") or ["- 데이터 없음"]); lines.append("")
-    lines.append("*🔥 급상승*");       lines.extend(S.get("rising") or ["- 해당 없음"]); lines.append("")
-    lines.append("*🆕 뉴랭커*");       lines.extend(S.get("newcomers") or ["- 해당 없음"]); lines.append("")
-    lines.append("*📉 급하락*");       lines.extend(S.get("falling") or ["- 해당 없음"])
+def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
+    # 부분 수집 시 헤더에 수집 개수 표시
+    header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
+    if total_count < 100:
+        header += f"  _(수집 {total_count}/100, 차단 가능성)_"
+    lines: List[str] = [header, "", "*TOP 10*"]
+    lines.extend(S.get("top10") or ["- 데이터 없음"]); lines.append("")
+    lines.append("*🔥 급상승*"); lines.extend(S.get("rising") or ["- 해당 없음"]); lines.append("")
+    lines.append("*🆕 뉴랭커*"); lines.extend(S.get("newcomers") or ["- 해당 없음"]); lines.append("")
+    lines.append("*📉 급하락*"); lines.extend(S.get("falling") or ["- 해당 없음"])
     lines.extend(S.get("outs") or [])
     lines.append(""); lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
@@ -546,8 +506,10 @@ def main():
     print("수집 시작: Amazon US Beauty & Personal Care")
     items = fetch_products()
     print("수집 완료:", len(items))
-    if len(items) < 80:  # 두 페이지 합산 최소 기대치
-        raise RuntimeError("제품 카드가 너무 적게 수집되었습니다. (차단/렌더링 점검 필요)")
+
+    # 부족하더라도 실패하지 않음
+    if len(items) < 30:
+        print("[경고] 수집 개수가 매우 적습니다. (봇 차단 가능성) — 계속 진행합니다.")
 
     df_today = to_dataframe(items, date_str)
     os.makedirs("data", exist_ok=True)
@@ -571,7 +533,7 @@ def main():
         print("[경고] GDRIVE_FOLDER_ID 미설정 → 드라이브 업로드/전일 비교 생략")
 
     S = build_sections(df_today, df_prev)
-    msg = build_slack_message(date_str, S)
+    msg = build_slack_message(date_str, S, total_count=len(items))
     slack_post(msg)
     print("Slack 전송 완료")
 
