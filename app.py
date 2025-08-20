@@ -38,6 +38,8 @@ def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace("
 
 USD_RE = re.compile(r"(?:US\$|\$)\s*([\d]{1,3}(?:,\d{3})*(?:\.\d{2})|[\d]+(?:\.\d{2})?)")
 ASIN_IN_HREF = re.compile(r"/dp/([A-Z0-9]{10})")
+ASIN_IN_QUERY = re.compile(r"[?&](?:pd_rd_i|asin|ASIN|m)=([A-Z0-9]{10})")
+ASIN_PCT = re.compile(r"(?:dp%2F|asin%2F)([A-Z0-9]{10})")
 BY_BRAND_RE = re.compile(r"\bby\s+([A-Za-z0-9&'’\-\.\s]{2,40})", re.I)
 
 def parse_usd_all(text: str) -> List[float]:
@@ -80,6 +82,45 @@ def canonical_amz_link(href: str, fallback_asin: str = "") -> str:
     if m: return f"https://www.amazon.com/dp/{m.group(1)}"
     return href or (f"https://www.amazon.com/dp/{fallback_asin}" if fallback_asin else "")
 
+def extract_asin_from_node(node) -> str:
+    # 1) data-asin on node/descendant/ancestor(2 up)
+    try:
+        val = node.get("data-asin")
+        if val: return val.strip()
+    except: pass
+    try:
+        d = node.select_one("[data-asin]")
+        if d:
+            v = d.get("data-asin")
+            if v: return v.strip()
+    except: pass
+    try:
+        p = node.parent
+        for _ in range(2):
+            if not p: break
+            v = p.get("data-asin")
+            if v: return v.strip()
+            p = p.parent
+    except: pass
+    # 2) hrefs
+    for a in node.select("a[href]"):
+        h = a.get("href") or ""
+        m = ASIN_IN_HREF.search(h) or ASIN_IN_QUERY.search(h) or ASIN_PCT.search(h)
+        if m: return m.group(1)
+    return ""
+
+def nearest_text_block(el):
+    txt = ""
+    cur = el
+    for _ in range(4):
+        if cur is None: break
+        try:
+            txt = clean_text(cur.get_text(" ", strip=True))
+            if len(txt) >= 20: break
+        except: pass
+        cur = cur.parent
+    return txt
+
 def extract_brand_from_container(c, title_text: str) -> str:
     # 1) 브랜드 스토어 링크
     for a in c.select("a[href]"):
@@ -104,16 +145,30 @@ def extract_brand_from_container(c, title_text: str) -> str:
         return ""
     return guess[:40]
 
-# ----------------- 정적 파싱 (data-asin 기준, 50개 목표) -----------------
+# ----------------- 정적 파싱 (다중 셀렉터 + ASIN 복구) -----------------
 def parse_http(html: str, offset: int) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
-    containers = soup.select("[data-asin]:not([data-asin=''])")
+    # 여러 구조를 커버
+    selectors = [
+        "ol[id*='zg-ordered-list'] li",
+        "[id*='gridItemRoot']",
+        "div.p13n-sc-uncoverable-faceout",
+        "div.zg-grid-general-faceout",
+        "[data-asin]",  # 최후
+    ]
+    containers = []
+    seen_nodes = set()
+    for sel in selectors:
+        for n in soup.select(sel):
+            if id(n) in seen_nodes: continue
+            containers.append(n); seen_nodes.add(id(n))
+
     items: List[Product] = []
-    seen = set()
+    seen_asin = set()
 
     for c in containers:
-        asin = (c.get("data-asin") or "").strip()
-        if not asin or asin in seen:
+        asin = extract_asin_from_node(c)
+        if not asin or asin in seen_asin:
             continue
 
         a = c.select_one("a[href*='/dp/']") or c.select_one("a.a-link-normal[href]")
@@ -137,7 +192,8 @@ def parse_http(html: str, offset: int) -> List[Product]:
         block = clean_text(c.get_text(" ", strip=True))
         prices = parse_usd_all(block)
         sale = orig = None
-        if len(prices) == 1: sale = prices[0]
+        if len(prices) == 1:
+            sale = prices[0]
         elif len(prices) >= 2:
             sale, orig = min(prices), max(prices)
             if sale == orig: orig = None
@@ -152,7 +208,7 @@ def parse_http(html: str, offset: int) -> List[Product]:
             url=link,
             asin=asin
         ))
-        seen.add(asin)
+        seen_asin.add(asin)
         if len(items) >= 50:
             break
 
@@ -188,11 +244,121 @@ def fetch_by_http() -> List[Product]:
             raise last_err
     return all_items
 
-# ----------------- Playwright 폴백 (data-asin 기준, 50개 되도록 스크롤) -----------------
+# ----------------- Playwright 폴백 (강화 스캐너) -----------------
 def fetch_page_playwright(url: str, offset: int) -> List[Product]:
     from playwright.sync_api import sync_playwright
-    import pathlib
 
+    def js_collector(offset):
+        return f"""
+        (offset) => {{
+          const rows = [];
+          const seen = new Set();
+
+          function uniq(nodes) {{
+            const set = new Set(); const out=[];
+            nodes.forEach(n=>{{ if(!set.has(n)){{ set.add(n); out.push(n); }} }});
+            return out;
+          }}
+
+          function selectCandidates(){{
+            const sels = [
+              "ol[id*='zg-ordered-list'] li",
+              "[id*='gridItemRoot']",
+              "div.p13n-sc-uncoverable-faceout",
+              "div.zg-grid-general-faceout",
+              "[data-asin]"
+            ];
+            let arr=[];
+            for(const sel of sels){{
+              arr = arr.concat(Array.from(document.querySelectorAll(sel)));
+            }}
+            if(arr.length < 30){{
+              // 폴백: /dp/ 앵커 기준으로 상위 컨테이너 추정
+              const a = Array.from(document.querySelectorAll("a[href*='/dp/']"));
+              for(const el of a){{
+                arr.push(el.closest("li")||el.closest("[data-asin]")||el.closest("div")||el);
+              }}
+            }}
+            return uniq(arr);
+          }}
+
+          function text(el){{ return (el && (el.innerText||"").replace(/\\s+/g," ").trim()) || ""; }}
+
+          function extractASIN(node){{
+            const g = (n)=>n && n.getAttribute && n.getAttribute("data-asin");
+            const d = g(node) || (node.querySelector && g(node.querySelector("[data-asin]")));
+            if(d) return d.trim();
+            let p=node.parentElement;
+            for(let i=0;i<2 && p;i++){{ const v=g(p); if(v) return v.trim(); p=p.parentElement; }}
+            const links = node.querySelectorAll ? node.querySelectorAll("a[href]") : [];
+            for(const l of links){{
+              const h = l.getAttribute("href") || "";
+              let m = h.match(/\\/dp\\/([A-Z0-9]{{10}})/) || h.match(/[?&](?:pd_rd_i|asin|ASIN|m)=([A-Z0-9]{{10}})/) || h.match(/(?:dp%2F|asin%2F)([A-Z0-9]{{10}})/);
+              if(m) return m[1];
+            }}
+            return "";
+          }}
+
+          function canonical(href, asin){{
+            if(!href && asin) return 'https://www.amazon.com/dp/'+asin;
+            if(href && href.startsWith('/')) href = 'https://www.amazon.com'+href;
+            const m = href && href.match(/\\/dp\\/([A-Z0-9]{{10}})/);
+            return m ? ('https://www.amazon.com/dp/'+m[1]) : (href || (asin ? 'https://www.amazon.com/dp/'+asin : ''));
+          }}
+
+          const cards = selectCandidates();
+          for(const c of cards){{
+            const asin = extractASIN(c);
+            if(!asin || seen.has(asin)) continue;
+
+            const a = c.querySelector("a[href*='/dp/']") || c.querySelector("a.a-link-normal[href]");
+            let title = a ? (a.getAttribute('aria-label') || a.getAttribute('title') || text(a)) : "";
+            if(!title){{
+              const img = c.querySelector("img[alt]");
+              if(img) title = (img.getAttribute('alt')||'').replace(/\\s+/g,' ').trim();
+            }}
+            if(!title){{
+              const t = c.querySelector("span.a-size-medium, span.a-size-base, span.p13n-sc-truncated");
+              if(t) title = text(t);
+            }}
+            if(!title) continue;
+
+            // 브랜드
+            let brand = "";
+            const storeA = c.querySelector("a[href*='/stores/']:not([href*='/dp/'])");
+            if(storeA){{
+              const bt = text(storeA);
+              if(bt && !/^(sponsored|see more)$/i.test(bt)) brand = bt;
+            }}
+            if(!brand){{
+              const block = text(c);
+              const m = block.match(/\\bby\\s+([A-Za-z0-9&'’\\-\\.\\s]{{2,40}})/i);
+              if(m) brand = (m[1]||'').replace(/\\s+/g,' ').trim();
+            }}
+
+            const blockTxt = text(c);
+            const prices = Array.from(blockTxt.matchAll(/(?:US\\$|\\$)\\s*([\\d]{{1,3}}(?:,\\d{{3}})*(?:\\.\\d{{2}})|[\\d]+(?:\\.\\d{{2}})?)/g)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v=>!isNaN(v)&&v>0);
+            let sale=null, orig=null;
+            if(prices.length===1) sale = prices[0];
+            else if(prices.length>=2){{ sale=Math.min(...prices); orig=Math.max(...prices); if(sale===orig) orig=null; }}
+
+            rows.push({{
+              rank: offset + rows.length + 1,
+              brand,
+              title,
+              price: sale,
+              orig_price: orig,
+              url: canonical(a ? a.getAttribute('href') : '', asin),
+              asin
+            }});
+            seen.add(asin);
+            if(rows.length>=50) break;
+          }}
+          return rows;
+        }}
+        """
+
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -211,14 +377,13 @@ def fetch_page_playwright(url: str, offset: int) -> List[Product]:
         try: page.wait_for_load_state("networkidle", timeout=30_000)
         except: pass
 
+        # 모달 닫기
         for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
             try: page.locator(sel).first.click(timeout=1200)
             except: pass
 
-        # 천천히 스크롤하며 카드 수 확보
+        # 충분히 로드될 때까지 스크롤
         for _ in range(22):
-            cnt = page.eval_on_selector_all("[data-asin]:not([data-asin=''])", "els => els.length")
-            if cnt and cnt >= 60: break
             try: page.mouse.wheel(0, 1600)
             except: pass
             page.wait_for_timeout(600)
@@ -227,82 +392,7 @@ def fetch_page_playwright(url: str, offset: int) -> List[Product]:
             ctx.close(); browser.close()
             return []
 
-        data = page.evaluate("""
-            (offset) => {
-              const rows = [];
-              const seen = new Set();
-              const cards = Array.from(document.querySelectorAll("[data-asin]:not([data-asin=''])"));
-              const usdRe = /(?:US\\$|\\$)\\s*([\\d]{1,3}(?:,\\d{3})*(?:\\.\\d{2})|[\\d]+(?:\\.\\d{2})?)/g;
-              const byBrandRe = /\\bby\\s+([A-Za-z0-9&'’\\-\\.\\s]{2,40})/i;
-
-              function canonical(href, asin){
-                if(!href && asin) return 'https://www.amazon.com/dp/' + asin;
-                if(href && href.startsWith('/')) href = 'https://www.amazon.com' + href;
-                const m = href && href.match(/\\/dp\\/([A-Z0-9]{10})/);
-                return m ? ('https://www.amazon.com/dp/' + m[1]) : (href || ('https://www.amazon.com/dp/' + asin));
-              }
-              function text(el){ return (el && (el.innerText||'').replace(/\\s+/g,' ').trim()) || ''; }
-
-              for(const c of cards){
-                const asin = (c.getAttribute('data-asin')||'').trim();
-                if(!asin || seen.has(asin)) continue;
-
-                const a = c.querySelector("a[href*='/dp/']") || c.querySelector("a.a-link-normal[href]");
-                const href = a ? a.getAttribute('href') : '';
-                let title = '';
-                if(a){
-                  title = (a.getAttribute('aria-label') || a.getAttribute('title') || (a.textContent||'')).replace(/\\s+/g,' ').trim();
-                }
-                if(!title){
-                  const img = c.querySelector('img[alt]');
-                  if(img) title = (img.getAttribute('alt')||'').replace(/\\s+/g,' ').trim();
-                }
-                if(!title){
-                  const t = c.querySelector('span.a-size-medium, span.a-size-base, span.p13n-sc-truncated');
-                  if(t) title = text(t);
-                }
-                if(!title) continue;
-
-                let brand = '';
-                const storeA = c.querySelector("a[href*='/stores/']:not([href*='/dp/'])");
-                if(storeA){
-                  const bt = text(storeA);
-                  if(bt && !/^(sponsored|see more)$/i.test(bt)) brand = bt;
-                }
-                if(!brand){
-                  const block = text(c);
-                  const m = block.match(byBrandRe);
-                  if(m) brand = (m[1]||'').replace(/\\s+/g,' ').trim();
-                }
-                if(!brand){
-                  const words = title.split(' ');
-                  if(words.length){
-                    brand = (words[0].length<=3 && words[1]) ? (words[0]+' '+words[1]) : words[0];
-                    if(/[0-9]/.test(brand) || /^(the|this|new|best|top)$/i.test(brand)) brand = '';
-                  }
-                }
-
-                const blockTxt = text(c);
-                const prices = Array.from(blockTxt.matchAll(usdRe)).map(m => parseFloat(m[1].replace(/,/g,''))).filter(v => !isNaN(v) && v>0);
-                let sale=null, orig=null;
-                if(prices.length===1) sale = prices[0];
-                else if(prices.length>=2){ sale=Math.min(...prices); orig=Math.max(...prices); if(sale===orig) orig=null; }
-
-                rows.push({
-                  rank: offset + rows.length + 1,
-                  brand,
-                  title,
-                  price: sale,
-                  orig_price: orig,
-                  url: canonical(href, asin),
-                  asin
-                });
-                seen.add(asin);
-                if(rows.length>=50) break;
-              }
-              return rows;
-            }
-        """, offset)
+        data = page.evaluate(js_collector(offset), offset)
         ctx.close(); browser.close()
 
     out: List[Product] = []
@@ -329,7 +419,7 @@ def fetch_by_playwright() -> List[Product]:
 def fetch_products() -> List[Product]:
     try:
         items = fetch_by_http()
-        if len(items) >= 80:  # 기대치
+        if len(items) >= 80:
             return items[:100]
     except Exception as e:
         print("[HTTP 오류] → Playwright 폴백:", e)
@@ -399,7 +489,10 @@ def slack_post(text: str):
         print("[Slack 실패]", r.status_code, r.text)
 
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
-    return pd.DataFrame([{
+    cols = ["date","rank","brand","product_name","price","orig_price","discount_percent","url","asin"]
+    if not products:
+        return pd.DataFrame(columns=cols)
+    df = pd.DataFrame([{
         "date": date_str,
         "rank": p.rank,
         "brand": p.brand,
@@ -409,11 +502,16 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
         "discount_percent": p.discount_percent,
         "url": p.url,
         "asin": p.asin,
-    } for p in products])
+    } for p in products], columns=cols)
+    return df
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
+    if df_today is None or "rank" not in df_today.columns or df_today.empty:
+        return S
+
+    # TOP10
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
     for _, r in top10.iterrows():
         name = clean_text(r["product_name"])
@@ -427,9 +525,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         dc = r.get("discount_percent"); tail = f" (↓{int(dc)}%)" if pd.notnull(dc) else ""
         S["top10"].append(f"{int(r['rank'])}. {name_link} — {price_txt}{tail}")
 
-    if df_prev is None or not len(df_prev):
+    if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns:
         return S
 
+    # 키: ASIN 우선, 없으면 URL
     df_t = df_today.copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
     df_t.set_index("key", inplace=True)
@@ -445,6 +544,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     new    = set(t30.index) - set(p30.index)
     out    = set(p30.index) - set(t30.index)
 
+    # 급상승(3)
     rising = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -455,6 +555,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     rising.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["rising"] = [x[-1] for x in rising[:3]]
 
+    # 뉴랭커(≤3)
     newcomers = []
     for k in new:
         cr = int(t30.loc[k,"rank"])
@@ -463,6 +564,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
+    # 급하락(5)
     falling = []
     for k in common:
         pr, cr = int(p30.loc[k,"rank"]), int(t30.loc[k,"rank"])
@@ -473,6 +575,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["falling"] = [x[-1] for x in falling[:5]]
 
+    # OUT
     for k in sorted(list(out)):
         pr = int(p30.loc[k,"rank"])
         nm = slack_escape(clean_text(p30.loc[k]["product_name"]))
@@ -482,7 +585,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     return S
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
-    # 부분 수집 시 헤더에 수집 개수 표시
     header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
     if total_count < 100:
         header += f"  _(수집 {total_count}/100, 차단 가능성)_"
@@ -507,7 +609,6 @@ def main():
     items = fetch_products()
     print("수집 완료:", len(items))
 
-    # 부족하더라도 실패하지 않음
     if len(items) < 30:
         print("[경고] 수집 개수가 매우 적습니다. (봇 차단 가능성) — 계속 진행합니다.")
 
