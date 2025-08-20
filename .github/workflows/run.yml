@@ -3,8 +3,8 @@ name: amazon_us_beauty_rankings
 on:
   workflow_dispatch:
   schedule:
-    # KST 09:10 = UTC 00:10
-    - cron: "10 0 * * *"
+    # KST 08:12 = UTC 23:12
+    - cron: "12 23 * * *"
 
 jobs:
   run:
