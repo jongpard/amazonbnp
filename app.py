@@ -1,51 +1,57 @@
 # -*- coding: utf-8 -*-
 """
 Amazon US - Beauty & Personal Care Best Sellers Top 100
-- Page 1: https://www.amazon.com/-/ko/Best-Sellers-/zgbs/beauty/ref=zg_bs_pg_1_beauty?_encoding=UTF8&pg=1
-- Page 2: https://www.amazon.com/-/ko/Best-Sellers-/zgbs/beauty/ref=zg_bs_pg_2_beauty?_encoding=UTF8&pg=2
-- HTTP(정적) 우선 → 부족 시 Playwright(동적) 폴백
+- Page 1: https://www.amazon.com/gp/bestsellers/beauty/ref=zg_b_bs_beauty_1
+- Page 2: https://www.amazon.com/Best-Sellers-Beauty-Personal-Care/zgbs/beauty/ref=zg_bs_pg_2_beauty?_encoding=UTF8&pg=2
+- HTTP(정적) 우선 → 429/부족 시 Playwright(동적) 폴백
 - 파일명: 아마존US_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 - 전일 CSV와 Top30 비교 → Slack 알림
 
-필요 환경변수 (Repository secrets):
+필요 Secrets:
   SLACK_WEBHOOK_URL
   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
   GDRIVE_FOLDER_ID
 """
-import os, re, io, math, pytz, traceback
+import os, re, io, math, pytz, time, random, traceback
 import datetime as dt
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
+# ----------------- 기본 설정 -----------------
 KST = pytz.timezone("Asia/Seoul")
 PAGE_URLS = [
-    "https://www.amazon.com/-/ko/Best-Sellers-/zgbs/beauty/ref=zg_bs_pg_1_beauty?_encoding=UTF8&pg=1",
-    "https://www.amazon.com/-/ko/Best-Sellers-/zgbs/beauty/ref=zg_bs_pg_2_beauty?_encoding=UTF8&pg=2",
+    "https://www.amazon.com/gp/bestsellers/beauty/ref=zg_b_bs_beauty_1",
+    "https://www.amazon.com/Best-Sellers-Beauty-Personal-Care/zgbs/beauty/ref=zg_bs_pg_2_beauty?_encoding=UTF8&pg=2",
+]
+UA_POOL = [
+    # 최근 Chrome UA 몇 개 로테이션
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
-# ---------- 시간/문자 유틸 ----------
 def now_kst(): return dt.datetime.now(KST)
 def today_kst_str(): return now_kst().strftime("%Y-%m-%d")
 def yesterday_kst_str(): return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 def build_filename(d): return f"아마존US_뷰티_랭킹_{d}.csv"
 def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
+def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ---------- 가격/표기 유틸 ----------
 USD_RE = re.compile(r"(?:US\$|\$)\s*([\d]{1,3}(?:,\d{3})*(?:\.\d{2})|[\d]+(?:\.\d{2})?)")
 ASIN_RE = re.compile(r"/dp/([A-Z0-9]{10})")
+
 def parse_usd_all(text: str) -> List[float]:
     vals = []
     for m in USD_RE.finditer(text or ""):
-        try:
-            vals.append(float(m.group(1).replace(",", "")))
+        try: vals.append(float(m.group(1).replace(",", "")))
         except: pass
-    # '무료 $0' 같은 노이즈 제거
-    return [v for v in vals if v > 0]
+    return [v for v in vals if v > 0]  # 0달러/노이즈 제거
+
 def fmt_currency_usd(v) -> str:
     try:
         if v is None or (isinstance(v, float) and math.isnan(v)): return "$0.00"
@@ -57,9 +63,7 @@ def discount_floor(orig: Optional[float], sale: Optional[float]) -> Optional[int
         return max(0, int(math.floor((1 - sale / orig) * 100)))
     return None
 
-def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-
-# ---------- 데이터 모델 ----------
+# ----------------- 데이터 모델 -----------------
 @dataclass
 class Product:
     rank: Optional[int]
@@ -71,11 +75,10 @@ class Product:
     url: str
     asin: str = ""
 
-# ---------- 보조 유틸 ----------
+# ----------------- 보조 -----------------
 def canonical_amz_link(href: str) -> str:
     if not href: return ""
     if href.startswith("/"): href = urljoin("https://www.amazon.com", href)
-    # /dp/ASIN 형태로 정리
     m = ASIN_RE.search(href)
     if not m: return href
     asin = m.group(1)
@@ -86,20 +89,19 @@ def extract_asin(href: str) -> str:
     return m.group(1) if m else ""
 
 def nearest_text_block(el):
-    """가격 탐색용으로 앵커에서 상위 컨테이너 몇 단계의 텍스트를 합침"""
-    block_txt = ""
+    """가격 탐색용: 앵커의 상위 컨테이너 텍스트 합치기"""
+    txt = ""
     cur = el
     for _ in range(6):
         if cur is None: break
         try:
-            block_txt = clean_text(cur.get_text(" ", strip=True))
-            if len(block_txt) >= 20:
-                break
+            txt = clean_text(cur.get_text(" ", strip=True))
+            if len(txt) >= 20: break
         except: pass
         cur = cur.parent
-    return block_txt
+    return txt
 
-# ---------- 정적 파싱 ----------
+# ----------------- 정적 파싱 -----------------
 def parse_http(html: str, offset: int) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
     anchors = soup.select("a[href*='/dp/']")
@@ -109,9 +111,10 @@ def parse_http(html: str, offset: int) -> List[Product]:
     for a in anchors:
         href = a.get("href") or ""
         asin = extract_asin(href)
-        if not asin or asin in seen:  # 중복/무효 제거
+        if not asin or asin in seen:
             continue
-        # 제목: aria-label > title > 텍스트 > 이미지 alt 순
+
+        # 제목: aria-label > title > 텍스트 > img alt
         name = (a.get("aria-label") or a.get("title") or clean_text(a.get_text(" ", strip=True)) or "")
         if not name:
             img = a.find("img")
@@ -123,7 +126,8 @@ def parse_http(html: str, offset: int) -> List[Product]:
         block_text = nearest_text_block(a)
         prices = parse_usd_all(block_text)
         sale = orig = None
-        if len(prices) == 1: sale = prices[0]
+        if len(prices) == 1:
+            sale = prices[0]
         elif len(prices) >= 2:
             sale, orig = min(prices), max(prices)
             if sale == orig: orig = None
@@ -142,35 +146,52 @@ def parse_http(html: str, offset: int) -> List[Product]:
         if len(items) >= 50:  # 페이지당 50개
             break
         seen.add(asin)
-
     return items
 
 def fetch_by_http() -> List[Product]:
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/123.0.0.0 Safari/537.36"),
-        "Accept-Language": "en-US,en;q=0.9,ko;q=0.7",
-        "Cache-Control": "no-cache", "Pragma": "no-cache",
-    }
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": random.choice(UA_POOL),
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.6",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    })
     all_items: List[Product] = []
     for idx, url in enumerate(PAGE_URLS):
-        r = requests.get(url, headers=headers, timeout=25)
-        r.raise_for_status()
-        items = parse_http(r.text, offset=idx * 50)
-        all_items.extend(items)
+        # 간단 백오프(429 등)
+        last_err = None
+        for attempt in range(3):
+            try:
+                r = s.get(url, timeout=25)
+                if r.status_code == 429:
+                    raise requests.HTTPError("429 Too Many Requests")
+                r.raise_for_status()
+                items = parse_http(r.text, offset=idx * 50)
+                all_items.extend(items)
+                # 페이지 간 짧은 랜덤 대기
+                time.sleep(random.uniform(1.0, 2.0))
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+        if last_err and len(all_items) < (idx * 50 + 10):
+            # 이 페이지는 사실상 실패로 보고 폴백에 맡김
+            raise last_err
     return all_items
 
-# ---------- Playwright 폴백 ----------
-def fetch_page_playwright(url: str, offset: int):
+# ----------------- Playwright 폴백 -----------------
+def fetch_page_playwright(url: str, offset: int) -> List[Product]:
     from playwright.sync_api import sync_playwright
-    import time, pathlib, re as _re
+    import pathlib
 
     def _dump(page, tag):
         pathlib.Path("data/debug").mkdir(parents=True, exist_ok=True)
-        with open(f"data/debug/amz_{tag}.html", "w", encoding="utf-8") as f:
+        with open(f"data/debug/amazon_{tag}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
-        page.screenshot(path=f"data/debug/amz_{tag}.png", full_page=True)
+        try: page.screenshot(path=f"data/debug/amazon_{tag}.png", full_page=True)
+        except: pass
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -181,9 +202,8 @@ def fetch_page_playwright(url: str, offset: int):
             viewport={"width":1366,"height":900},
             locale="en-US",
             timezone_id="America/Los_Angeles",
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123 Safari/537.36"),
-            extra_http_headers={"Accept-Language":"en-US,en;q=0.9,ko;q=0.7"},
+            user_agent=random.choice(UA_POOL),
+            extra_http_headers={"Accept-Language":"en-US,en;q=0.9,ko;q=0.6"},
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
@@ -191,26 +211,20 @@ def fetch_page_playwright(url: str, offset: int):
         try: page.wait_for_load_state("networkidle", timeout=30_000)
         except: pass
 
-        # 쿠키/지역/모달 닫기
-        for sel in ["#sp-cc-accept", "button[name='accept',i]", "input#sp-cc-accept", "button:has-text('Accept')"]:
+        # 쿠키/동의 모달 닫기
+        for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
             try: page.locator(sel).first.click(timeout=1200)
             except: pass
 
-        # 충분한 앵커가 보일 때까지 폴링
-        start = time.time()
-        found = 0
-        while time.time() - start < 35:
-            try:
-                found = page.eval_on_selector_all("a[href*='/dp/']", "els => els.length")
-            except: found = 0
-            if found and found >= 60:  # 여유치
-                break
-            try: page.mouse.wheel(0, 1400)
+        # 충분히 로드될 때까지 천천히 스크롤
+        for _ in range(10):
+            try: page.mouse.wheel(0, 1600)
             except: pass
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(600)
 
-        if not (found and found >= 20):
-            _dump(page, f"fail_{offset}")
+        # 캡차 페이지 방어
+        if "captcha" in (page.url or "").lower():
+            _dump(page, f"captcha_{offset}")
             ctx.close(); browser.close()
             return []
 
@@ -266,7 +280,7 @@ def fetch_page_playwright(url: str, offset: int):
                   asin
                 });
                 seen.add(asin);
-                if(rows.length>=50) break; // per page
+                if(rows.length>=50) break;
               }
               return rows;
             }
@@ -291,18 +305,20 @@ def fetch_by_playwright() -> List[Product]:
     all_items: List[Product] = []
     for idx, url in enumerate(PAGE_URLS):
         all_items.extend(fetch_page_playwright(url, offset=idx*50))
+        # 페이지 간 짧은 대기(봇탐지 완화)
+        time.sleep(1.0)
     return all_items
 
 def fetch_products() -> List[Product]:
     try:
         items = fetch_by_http()
-        if len(items) >= 60:  # 1,2페이지 합산 기준
+        if len(items) >= 60:
             return items[:100]
     except Exception as e:
         print("[HTTP 오류] → Playwright 폴백:", e)
     return fetch_by_playwright()[:100]
 
-# ---------- Google Drive ----------
+# ----------------- Drive -----------------
 def normalize_folder_id(raw: str) -> str:
     if not raw: return ""
     s = raw.strip()
@@ -356,7 +372,7 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     while not done: _, done = dl.next_chunk()
     fh.seek(0); return pd.read_csv(fh)
 
-# ---------- Slack ----------
+# ----------------- Slack/메시지 -----------------
 def slack_post(text: str):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
@@ -365,7 +381,6 @@ def slack_post(text: str):
     if r.status_code >= 300:
         print("[Slack 실패]", r.status_code, r.text)
 
-# ---------- 비교/메시지 ----------
 def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
     return pd.DataFrame([{
         "date": date_str,
@@ -462,7 +477,7 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]]) -> str:
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
 
-# ---------- 메인 ----------
+# ----------------- 메인 -----------------
 def main():
     date_str = today_kst_str()
     ymd_yesterday = yesterday_kst_str()
