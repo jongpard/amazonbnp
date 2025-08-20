@@ -1,0 +1,43 @@
+name: amazon_us_beauty_rankings
+
+on:
+  workflow_dispatch:
+  schedule:
+    # KST 09:10 = UTC 00:10
+    - cron: "10 0 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          pip install requests pandas beautifulsoup4 lxml pytz google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
+          python -m playwright install chromium --with-deps
+
+      - name: Run crawler
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          python app.py
+
+      - name: Upload CSV artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: amazon-us-beauty-csv
+          path: data/*.csv
