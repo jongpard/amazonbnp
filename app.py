@@ -423,33 +423,33 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                         pass
 
                 if clicked:
-    # 2페이지 로딩 대기
-    try:
-        page.wait_for_load_state("networkidle", timeout=20_000)
-    except:
-        pass
+                    # 2페이지 로딩 대기
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=20_000)
+                    except:
+                        pass
 
-    # 조금 더 내려서 레이지로드 강제
-    try:
-        for _ in range(18):
-            try:
-                page.mouse.wheel(0, 1600)
-            except:
-                pass
-            page.wait_for_timeout(400)
-    except:
-        pass
+                    # 조금 더 내려서 레이지로드 강제
+                    try:
+                        for _ in range(18):
+                            try:
+                                page.mouse.wheel(0, 1600)
+                            except:
+                                pass
+                            page.wait_for_timeout(400)
+                    except:
+                        pass
 
-    # JS 평가 (실패 시 빈 리스트로 처리해 상위 로직 계속 진행)
-    try:
-        data = page.evaluate(js, page_idx)
-    except Exception as e:
-        print("[Playwright] evaluate after Next click failed:", e)
-        data = []
-else:
-    print("[Playwright] Next 클릭 셀렉터 매칭 실패")
-except Exception as e:
-    print("[Playwright] Next-click fallback 실패:", e)
+                    # JS 평가 (실패 시 빈 리스트로 처리해 상위 로직 계속 진행)
+                    try:
+                        data = page.evaluate(js, page_idx)
+                    except Exception as e:
+                        print("[Playwright] evaluate after Next click failed:", e)
+                        data = []
+                else:
+                    print("[Playwright] Next 클릭 셀렉터 매칭 실패")
+                except Exception as e:
+                    print("[Playwright] Next-click fallback 실패:", e)
 
         ctx.close(); browser.close()
 
