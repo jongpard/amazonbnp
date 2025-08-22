@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Amazon US - Beauty & Personal Care Best Sellers Top 100
-- 페이지별로 1~50 랭크를 뱃지/aria-posinset으로 정확히 매핑
-- HTTP 우선 → 부족/429 시 Playwright 폴백
+- 페이지별 1~50 랭크 정렬(배지/aria-posinset/데이터 인덱스 사용)
+- HTTP 우선 → 부족/429/리다이렉트 등 발생 시 Playwright 폴백
+- 2페이지 문제 대비: 1페이지 → Next 클릭 폴백
 - 파일명: 아마존US_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 """
 import os, re, io, math, pytz, time, random, traceback
 import datetime as dt
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -196,7 +197,7 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
         if not title:
             t = node.select_one("span.a-size-medium, span.a-size-base, span.p13n-sc-truncated")
             if t: title = clean_text(t.get_text(" ", strip=True))
-        if not title: 
+        if not title:
             continue
 
         brand = extract_brand_from_container(node, title)
@@ -216,14 +217,10 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
         if rank_in_page and 1 <= rank_in_page <= 50 and rank_in_page not in by_rank:
             by_rank[rank_in_page] = p
         else:
-            # 임시 버킷(-1)에 쌓았다가 빈 랭크에 채움
             by_rank.setdefault(-1, [])
             by_rank[-1].append(p)
 
         seen_asin.add(asin)
-
-        if len(by_rank) >= 55:  # 여유치
-            pass
 
     # 빈 랭크 채우기
     extras = by_rank.get(-1, [])
@@ -239,6 +236,41 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
     return out
 
 # ----------------- HTTP 수집 -----------------
+def http_fetch_page(url: str, page_idx: int) -> List[Product]:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": random.choice(UA_POOL),
+        "Accept-Language": "en-US,en;q=0.9,ko;q=0.6",
+        "Cache-Control": "no-cache", "Pragma": "no-cache", "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    })
+    last_err=None
+    for attempt in range(3):
+        try:
+            r = s.get(url, timeout=25)
+            if r.status_code==429: raise requests.HTTPError("429 Too Many Requests")
+            r.raise_for_status()
+            return parse_http(r.text, page_idx)
+        except Exception as e:
+            last_err=e; time.sleep(1.5*(attempt+1))
+    if last_err: raise last_err
+    return []
+
+def fetch_by_http() -> List[Product]:
+    all_items: List[Product] = []
+    for page_idx, urls in enumerate(PAGE_CANDIDATES):
+        got: List[Product] = []
+        for u in urls:
+            try:
+                got = http_fetch_page(u, page_idx)
+                if len(got) >= 48: break
+            except Exception:
+                continue
+        all_items.extend(got)
+        time.sleep(random.uniform(0.8,1.5))
+    return all_items
+
+# ----------------- Playwright 폴백 -----------------
 def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     from playwright.sync_api import sync_playwright
 
@@ -402,6 +434,20 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
             print("[Playwright] evaluate 1st try failed:", e)
             data = []
 
+        # page1도 부족하면 한 번 더 새로고침 후 재시도
+        if page_idx == 0 and (not isinstance(data, list) or len(data) < 45):
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60_000)
+                try: page.wait_for_load_state("networkidle", timeout=20_000)
+                except: pass
+                for _ in range(18):
+                    try: page.mouse.wheel(0, 1600)
+                    except: pass
+                    page.wait_for_timeout(400)
+                data = page.evaluate(js, page_idx)
+            except Exception as e:
+                print("[Playwright] page1 reload fallback failed:", e)
+
         # 2) 2페이지가 비거나 부족하면: 1페이지 → Next 클릭 폴백
         if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
             try:
@@ -487,12 +533,13 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     return out
 
 def fetch_by_playwright() -> List[Product]:
-    all_items=[]
+    all_items: List[Product] = []
     for page_idx, urls in enumerate(PAGE_CANDIDATES):
-        got=[]
+        got: List[Product] = []
         for u in urls:
             got = fetch_page_playwright(u, page_idx)
-            if len(got) >= 48: break
+            if len(got) >= 48:
+                break
         all_items.extend(got)
         time.sleep(0.8)
     return all_items
@@ -501,19 +548,15 @@ def fetch_by_playwright() -> List[Product]:
 def fetch_products() -> List[Product]:
     try:
         items = fetch_by_http()
-        if len(items) >= 96:  # 거의 다 모이면 OK
-            pass
-        else:
+        if len(items) < 96:  # 부족하면 폴백
             raise RuntimeError("HTTP 수집 부족")
     except Exception as e:
         print("[HTTP 오류] → Playwright 폴백:", e)
         items = fetch_by_playwright()
 
     # 중복 ASIN 제거 + 1~100 재정렬
-    uniq: Dict[int, Product] = {}
     by_rank: Dict[int, Product] = {}
     for p in items:
-        if not p.asin or p.asin in uniq.values(): continue
         if p.rank: by_rank[p.rank] = p
     out=[]
     for r in range(1, 101):
@@ -588,9 +631,9 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
 
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     """
-    Slack에 보낼 섹션 텍스트들을 구성한다.
-    - TOP10: 전일 파일과 비교해 (↑n)/(↓n)/(-)/(new) 표시
-    - 나머지 섹션(급상승/뉴랭커/급하락/OUT)은 기존 로직 유지
+    Slack 섹션 구성:
+    - TOP10: 전일 대비 (↑n)/(↓n)/(-)/(new) 표시
+    - 급상승/뉴랭커/급하락/OUT 기존 로직 유지
     """
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
@@ -615,18 +658,11 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         key = (str(r.get("asin")).strip() or str(r.get("url")).strip())
         prev_rank = prev_rank_map.get(key)
 
-        # 등락 배지
-        if prev_rank is None:
-            badge = "(new)"
-        else:
-            if prev_rank > cur_rank:
-                badge = f"(↑{prev_rank - cur_rank})"
-            elif prev_rank < cur_rank:
-                badge = f"(↓{cur_rank - prev_rank})"
-            else:
-                badge = "(-)"
+        if prev_rank is None: badge = "(new)"
+        elif prev_rank > cur_rank: badge = f"(↑{prev_rank - cur_rank})"
+        elif prev_rank < cur_rank: badge = f"(↓{cur_rank - prev_rank})"
+        else: badge = "(-)"
 
-        # 표시 이름(브랜드가 제품명 앞에 안 붙어 있으면 붙여주기)
         name = clean_text(r["product_name"])
         br = clean_text(r.get("brand", ""))
         name_show = f"{br} {name}" if br and not name.lower().startswith(br.lower()) else name
@@ -638,11 +674,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
         S["top10"].append(f"{cur_rank}. {badge} {name_link} — {price_txt}{dc_tail}")
 
-    # ===== 아래부터는 기존 로직 유지 =====
+    # ===== 이하 기존 로직 =====
     if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns:
         return S
 
-    # 키: ASIN 우선, 없으면 URL
     df_t = df_today.copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
     df_t.set_index("key", inplace=True)
@@ -704,7 +739,6 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int
         header += f"  _(수집 {total_count}/100)_"
 
     lines: List[str] = [header, "", "*TOP 10*"]
-    # TOP10은 위에서 이미 등락 포함해 생성됨
     lines.extend(S.get("top10") or ["- 데이터 없음"]); lines.append("")
     lines.append("*🔥 급상승*"); lines.extend(S.get("rising") or ["- 해당 없음"]); lines.append("")
     lines.append("*🆕 뉴랭커*"); lines.extend(S.get("newcomers") or ["- 해당 없음"]); lines.append("")
