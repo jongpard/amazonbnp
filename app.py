@@ -3,7 +3,8 @@
 Amazon US - Beauty & Personal Care Best Sellers Top 100
 - 페이지별 1~50 랭크 정렬(배지/aria-posinset/데이터 인덱스 사용)
 - HTTP 우선 → 부족/429/리다이렉트 등 발생 시 Playwright 폴백
-- 2페이지 문제 대비: 1페이지 → Next 클릭 폴백
+- 2페이지 문제 대비: 1페이지 → Next 클릭 / href 직접 이동 폴백
+- 수집 수가 100 미만이면 Playwright 한 번 더 재시도 후 병합
 - 파일명: 아마존US_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 """
 import os, re, io, math, pytz, time, random, traceback
@@ -94,7 +95,6 @@ def canonical_amz_link(href: str, fallback_asin: str = "") -> str:
     return f"https://www.amazon.com/dp/{m.group(1)}" if m else (href or (f"https://www.amazon.com/dp/{fallback_asin}" if fallback_asin else ""))
 
 def extract_asin_from_node(node) -> str:
-    # data-asin (self/child/ancestors)
     for target in (node, getattr(node, "parent", None), getattr(getattr(node, "parent", None), "parent", None)):
         try:
             v = target.get("data-asin")
@@ -106,7 +106,6 @@ def extract_asin_from_node(node) -> str:
             v = d.get("data-asin")
             if v: return v.strip()
     except: pass
-    # hrefs
     for a in node.select("a[href]"):
         h = a.get("href") or ""
         m = ASIN_IN_HREF.search(h) or ASIN_IN_QUERY.search(h) or ASIN_PCT.search(h)
@@ -114,19 +113,16 @@ def extract_asin_from_node(node) -> str:
     return ""
 
 def extract_rank_from_node(node) -> Optional[int]:
-    # aria-posinset on li
     try:
         v = node.get("aria-posinset")
         if v and v.isdigit(): return int(v)
     except: pass
-    # badge text like "#17"
     try:
         b = node.select_one(".zg-badge-text, .a-badge-text")
         if b:
             m = re.search(r"#?\s*(\d{1,3})", b.get_text(" ", strip=True))
             if m: return int(m.group(1))
     except: pass
-    # data-index
     try:
         v = node.get("data-index")
         if v and v.isdigit(): return int(v)+1
@@ -134,7 +130,6 @@ def extract_rank_from_node(node) -> Optional[int]:
     return None
 
 def extract_brand_from_container(c, title_text: str) -> str:
-    # /stores/ 링크 (Visit the ... Store 포함)
     for a in c.select("a[href*='/stores/']:not([href*='/dp/'])"):
         t = clean_text(a.get_text(" ", strip=True))
         if not t: continue
@@ -151,7 +146,6 @@ def extract_brand_from_container(c, title_text: str) -> str:
     if m:
         cand = clean_text(m.group(1))
         if cand: return cand[:40]
-    # 제목 선두 보수 추정(항상 반환)
     title = clean_text(title_text or "")
     words = title.split()
     if not words: return ""
@@ -210,7 +204,6 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
             sale,orig=min(prices),max(prices)
             if sale==orig: orig=None
 
-        # page rank가 없으면 뒤에서 채움
         p = Product(rank=None, brand=brand, title=title, price=sale,
                     orig_price=orig, discount_percent=discount_floor(orig, sale),
                     url=link, asin=asin)
@@ -222,7 +215,6 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
 
         seen_asin.add(asin)
 
-    # 빈 랭크 채우기
     extras = by_rank.get(-1, [])
     out: List[Product] = []
     for r in range(1, 51):
@@ -536,7 +528,6 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                         print("[Playwright] href-goto fallback failed:", e)
 
                 if clicked:
-                    # 레이지로드 유도 후 재수집
                     for _ in range(22):
                         try:
                             page.mouse.wheel(0, 1600)
@@ -582,27 +573,44 @@ def fetch_by_playwright() -> List[Product]:
         time.sleep(0.8)
     return all_items
 
-# ----------------- 통합 수집 -----------------
-def fetch_products() -> List[Product]:
-    try:
-        items = fetch_by_http()
-        if len(items) < 96:  # 부족하면 폴백
-            raise RuntimeError("HTTP 수집 부족")
-    except Exception as e:
-        print("[HTTP 오류] → Playwright 폴백:", e)
-        items = fetch_by_playwright()
-
-    # 중복 ASIN 제거 + 1~100 재정렬
+# ----------------- 통합 수집 + 재시도 -----------------
+def merge_by_rank(*lists: List[Product]) -> List[Product]:
     by_rank: Dict[int, Product] = {}
-    for p in items:
-        if p.rank: by_rank[p.rank] = p
+    for L in lists:
+        for p in (L or []):
+            if p.rank: by_rank[p.rank] = p
     out=[]
     for r in range(1, 101):
         if r in by_rank:
-            p = by_rank[r]
-            p.rank = r
-            out.append(p)
+            p = by_rank[r]; p.rank = r; out.append(p)
     return out
+
+def fetch_products() -> List[Product]:
+    # 1) HTTP 시도
+    try:
+        items_http = fetch_by_http()
+        if len(items_http) >= 96:
+            items = items_http
+        else:
+            raise RuntimeError("HTTP 수집 부족")
+    except Exception as e:
+        print("[HTTP 오류] → Playwright 폴백:", e)
+        items = []
+
+    # 2) Playwright (필요 시)
+    if len(items) < 96:
+        items_pw = fetch_by_playwright()
+        items = merge_by_rank(items, items_pw)
+
+    # 3) 여전히 100 미만이면 한 번 더 Playwright 재시도
+    if len(items) < 100:
+        print("[재시도] Playwright 한 번 더 실행")
+        time.sleep(1.0)
+        items_pw2 = fetch_by_playwright()
+        items = merge_by_rank(items, items_pw2)
+
+    # 최종 1~100만 정렬
+    return merge_by_rank(items)
 
 # ----------------- Drive -----------------
 def normalize_folder_id(raw: str) -> str:
@@ -667,13 +675,14 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
         "url": p.url, "asin": p.asin,
     } for p in products], columns=cols)
 
+# ----------------- Slack 섹션/메시지 -----------------
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     """
     Slack 섹션 구성:
     - TOP10: 전일 대비 (↑n)/(↓n)/(-)/(new) 표시
-    - 급상승/급하락: 1~100 전체 비교, 각 최대 5개
-    - OUT: 전일 1~100 중 오늘 OUT인 항목을 전일 순위 오름차순으로 최대 5개
-    - 뉴랭커: 상위 30 진입 최대 3개(기존 유지)
+    - 급상승/급하락: 1~100 전체 비교, '변동 10계단 이상'만, 각 최대 5개
+    - OUT: 전일 1~70에 있던 항목 중 오늘 OUT, 전일 순위 오름차순으로 최대 5개
+    - 뉴랭커: 상위 30 진입 최대 3개(유지)
     """
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
     if df_today is None or "rank" not in df_today.columns or df_today.empty:
@@ -711,10 +720,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
         S["top10"].append(f"{cur_rank}. {badge} {name_link} — {price_txt}{dc_tail}")
 
-    # ===== 전일 대비 비교용 (1~100 전체) =====
     if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns:
         return S
 
+    # 1~100 전체 비교 준비
     df_t = df_today.copy()
     df_t = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 100)].copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
@@ -729,23 +738,23 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     new_all    = set(df_t.index) - set(df_p.index)
     out_all    = set(df_p.index) - set(df_t.index)
 
-    # 🔥 급상승 (Top100 전체, 최대 5)
+    # 🔥 급상승 (Top100 전체, 10계단↑ 이상, 최대 5)
     rising = []
     for k in common_all:
         pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
         imp = pr - cr
-        if imp > 0:
+        if imp >= 10:
             nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
             rising.append((imp, cr, pr, nm, f"- <{df_t.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↑{imp})"))
     rising.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["rising"] = [x[-1] for x in rising[:5]]
 
-    # 📉 급하락 (Top100 전체, 최대 5)
+    # 📉 급하락 (Top100 전체, 10계단↓ 이상, 최대 5)
     falling = []
     for k in common_all:
         pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
         drop = cr - pr
-        if drop > 0:
+        if drop >= 10:
             nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
             falling.append((drop, cr, pr, nm, f"- <{df_t.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↓{drop})"))
     falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
@@ -763,18 +772,18 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
-    # ❌ OUT (전일 1~100 → 오늘 OUT, 전일 순위 오름차순으로 최대 5개)
+    # ❌ OUT (전일 1~70 → 오늘 OUT, 전일 순위 오름차순으로 최대 5개)
     outs = []
     for k in out_all:
         pr = int(df_p.loc[k, "rank"])
-        nm = slack_escape(clean_text(df_p.loc[k]["product_name"]))
-        outs.append((pr, f"- <{df_p.loc[k]['url']}|{nm}> {pr}위 → OUT"))
+        if pr <= 70:
+            nm = slack_escape(clean_text(df_p.loc[k]["product_name"]))
+            outs.append((pr, f"- <{df_p.loc[k]['url']}|{nm}> {pr}위 → OUT"))
     outs.sort(key=lambda x: x[0])
     S["outs"] = [x[1] for x in outs[:5]]
 
     S["inout_count"] = len(new_all) + len(out_all)
     return S
-
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
     header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
@@ -790,8 +799,6 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int
     lines.append(""); lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
-
-
 
 # ----------------- 메인 -----------------
 def main():
