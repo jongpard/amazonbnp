@@ -337,7 +337,7 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
         if(!brand){ const ws=title.split(' '); if(ws.length){ brand=(ws[0].length<=3 && ws[1]) ? (ws[0]+' '+ws[1]) : ws[0]; } }
 
         const blk=text(c);
-        const prices = Array.from(blk.matchAll(usdRe)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v=>!isNaN(v)&&v>0);
+        const prices = Array.from(blk.matchAll(usdRe)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v=>!isNaN(v)&&v>0;
         let sale=null, orig=null; if(prices.length===1) sale=prices[0]; else if(prices.length>=2){ sale=Math.min(...prices); orig=Math.max(...prices); if(sale===orig) orig=null; }
 
         const row = {rank:null, brand, title, price:sale, orig_price:orig, url: canonical(a ? a.getAttribute('href') : '', asin), asin};
@@ -369,15 +369,72 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
+
+        # 1) 후보 URL로 직접 진입
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         try: page.wait_for_load_state("networkidle", timeout=30_000)
         except: pass
-        # 스크롤로 카드 충분 확보
+
+        # 쿠키/동의 모달 닫기
+        for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
+            try: page.locator(sel).first.click(timeout=1200)
+            except: pass
+
+        # 충분히 스크롤
         for _ in range(24):
             try: page.mouse.wheel(0, 1600)
             except: pass
             page.wait_for_timeout(600)
+
         data = page.evaluate(js, page_idx)
+
+        # 2) 2페이지가 비거나 부족하면: 1페이지 → Next 클릭 폴백
+        if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
+            try:
+                print("[Playwright] page2 부족 → Next-click fallback")
+                # 1페이지로 먼저 진입
+                page.goto(PAGE_CANDIDATES[0][0], wait_until="domcontentloaded", timeout=60_000)
+                try: page.wait_for_load_state("networkidle", timeout=20_000)
+                except: pass
+
+                for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
+                    try: page.locator(sel).first.click(timeout=1200)
+                    except: pass
+
+                # 페이지네이션 근처로 한번 내려줌
+                for _ in range(6):
+                    try: page.mouse.wheel(0, 1200)
+                    except: pass
+                    page.wait_for_timeout(200)
+
+                clicked = False
+                for sel in [
+                    "a[href*='pg=2']",
+                    "a[aria-label*='Next']",
+                    "li.a-last a",
+                    "a:has-text('Next')",
+                    "ul.a-pagination li.a-last a"
+                ]:
+                    try:
+                        page.locator(sel).first.click(timeout=4000)
+                        clicked = True
+                        break
+                    except:
+                        pass
+
+                if clicked:
+                    try: page.wait_for_load_state("networkidle", timeout=20_000)
+                    except: pass
+                    for _ in range(18):
+                        try: page.mouse.wheel(0, 1600)
+                        except: pass
+                        page.wait_for_timeout(400)
+                    data = page.evaluate(js, page_idx)
+                else:
+                    print("[Playwright] Next 클릭 셀렉터 매칭 실패")
+            except Exception as e:
+                print("[Playwright] Next-click fallback 실패:", e)
+
         ctx.close(); browser.close()
 
     out=[]
@@ -602,7 +659,6 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     S["inout_count"] = len(new) + len(out)
     return S
 
-
 def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
     header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
     if total_count < 100:
@@ -618,7 +674,6 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int
     lines.append(""); lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
-
 
 # ----------------- 메인 -----------------
 def main():
