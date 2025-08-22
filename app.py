@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Amazon US - Beauty & Personal Care Best Sellers Top 100
-- 페이지별 1~50 랭크 정렬(배지/aria-posinset/데이터 인덱스 사용)
-- HTTP 우선 → 부족/429/리다이렉트 등 발생 시 Playwright 폴백
-- 2페이지 문제 대비: 1페이지 → Next 클릭 / href 직접 이동 폴백
-- 수집 수가 100 미만이면 Playwright 한 번 더 재시도 후 병합
+
+- HTTP 우선 수집 → 부족하면 Playwright 폴백
+- 2페이지 이슈 대응:
+  * 스크롤/대기 강화
+  * 카드 수 적으면 앵커(/dp/) 기반으로 보강(HTTP/JS 모두)
+  * 1페이지 → Next 클릭, 실패 시 href 추출하여 직접 이동
+- 수집 수가 100 미만이면 Playwright 한 번 더 재시도하여 병합
+- Slack:
+  * TOP10 전일 대비 배지 (↑/↓/(-)/(new))
+  * 급상승/급하락: Top100 전체, 변동폭 10계단 이상, 최대 5개
+  * OUT: 전일 1~70 → 오늘 OUT, 전일 순위 오름차순, 최대 5개
 - 파일명: 아마존US_뷰티_랭킹_YYYY-MM-DD.csv (KST)
 """
 import os, re, io, math, pytz, time, random, traceback
@@ -17,8 +24,14 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# ----------------- 기본 설정 -----------------
+# ==================== 공통 유틸 ====================
 KST = pytz.timezone("Asia/Seoul")
+def now_kst(): return dt.datetime.now(KST)
+def today_kst_str(): return now_kst().strftime("%Y-%m-%d")
+def yesterday_kst_str(): return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+def build_filename(d): return f"아마존US_뷰티_랭킹_{d}.csv"
+def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
+def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 PAGE_CANDIDATES = [
     [  # page 1
@@ -38,13 +51,6 @@ UA_POOL = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
-
-def now_kst(): return dt.datetime.now(KST)
-def today_kst_str(): return now_kst().strftime("%Y-%m-%d")
-def yesterday_kst_str(): return (now_kst() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
-def build_filename(d): return f"아마존US_뷰티_랭킹_{d}.csv"
-def clean_text(s): return re.sub(r"\s+", " ", (s or "")).strip()
-def slack_escape(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 USD_RE = re.compile(r"(?:US\$|\$)\s*([\d]{1,3}(?:,\d{3})*(?:\.\d{2})|[\d]+(?:\.\d{2})?)")
 ASIN_IN_HREF  = re.compile(r"/dp/([A-Z0-9]{10})")
@@ -73,7 +79,6 @@ def discount_floor(orig: Optional[float], sale: Optional[float]) -> Optional[int
     if orig and sale and orig>0: return max(0,int(math.floor((1 - sale/orig)*100)))
     return None
 
-# ----------------- 모델 -----------------
 @dataclass
 class Product:
     rank: Optional[int]
@@ -85,7 +90,7 @@ class Product:
     url: str
     asin: str = ""
 
-# ----------------- 보조 -----------------
+# ==================== 공통 보조 ====================
 def canonical_amz_link(href: str, fallback_asin: str = "") -> str:
     if not href and fallback_asin:
         return f"https://www.amazon.com/dp/{fallback_asin}"
@@ -135,7 +140,7 @@ def extract_brand_from_container(c, title_text: str) -> str:
         if not t: continue
         m = VISIT_STORE_RE.search(t)
         if m: return clean_text(m.group(1))[:40]
-        if t.lower() not in ("sponsored","see more"):
+        if t.lower() not in ("sponsored", "see more"):
             return t[:40]
     block = clean_text(c.get_text(" ", strip=True))
     m = BRAND_LABEL_RE.search(block)
@@ -152,7 +157,7 @@ def extract_brand_from_container(c, title_text: str) -> str:
     guess = (words[0] + (" " + words[1] if len(words[0]) <= 3 and len(words) >= 2 else ""))
     return guess[:40]
 
-# ----------------- 파서 (페이지별 1~50 맵) -----------------
+# ==================== HTTP 파서 ====================
 def parse_http(html: str, page_idx: int) -> List[Product]:
     soup = BeautifulSoup(html, "lxml")
     selectors = [
@@ -162,22 +167,34 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
         "div.zg-grid-general-faceout",
         "[data-asin]"
     ]
+    def uniq(nodes):
+        seen=set(); out=[]
+        for n in nodes:
+            if id(n) not in seen:
+                seen.add(id(n)); out.append(n)
+        return out
+
     candidates=[]
-    seen=set()
     for sel in selectors:
-        for n in soup.select(sel):
-            if id(n) in seen: continue
-            candidates.append(n); seen.add(id(n))
+        candidates += soup.select(sel)
+    candidates = uniq(candidates)
+
+    # 카드가 부족하면 앵커(/dp/) 기반 보강 (최대 70개 될 때까지)
+    if len(candidates) < 60:
+        anchors = soup.select("a[href*='/dp/']")
+        for a in anchors:
+            blk = a.find_parent("li") or a.find_parent(attrs={"data-asin": True}) or a.find_parent("div") or a
+            candidates.append(blk)
+        candidates = uniq(candidates)
 
     by_rank: Dict[int, Product] = {}
     seen_asin=set()
+    extras=[]
 
     for node in candidates:
         rank_in_page = extract_rank_from_node(node)
         asin = extract_asin_from_node(node)
-        if not asin: continue
-        if asin in seen_asin:  # 중복 카드 방지
-            continue
+        if not asin or asin in seen_asin: continue
 
         a = node.select_one("a[href*='/dp/']") or node.select_one("a.a-link-normal[href]")
         href = a.get("href") if a else ""
@@ -191,7 +208,8 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
         if not title:
             t = node.select_one("span.a-size-medium, span.a-size-base, span.p13n-sc-truncated")
             if t: title = clean_text(t.get_text(" ", strip=True))
-        if not title:
+        if not title: 
+            seen_asin.add(asin); 
             continue
 
         brand = extract_brand_from_container(node, title)
@@ -210,24 +228,19 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
         if rank_in_page and 1 <= rank_in_page <= 50 and rank_in_page not in by_rank:
             by_rank[rank_in_page] = p
         else:
-            by_rank.setdefault(-1, [])
-            by_rank[-1].append(p)
+            extras.append(p)
 
         seen_asin.add(asin)
 
-    extras = by_rank.get(-1, [])
-    out: List[Product] = []
-    for r in range(1, 51):
-        if r in by_rank:
-            item = by_rank[r]
-        else:
-            item = extras.pop(0) if extras else None
+    out=[]
+    for r in range(1, 50+1):
+        item = by_rank.get(r) or (extras.pop(0) if extras else None)
         if not item: continue
         item.rank = page_idx*50 + r
         out.append(item)
     return out
 
-# ----------------- HTTP 수집 -----------------
+# ==================== HTTP 수집 ====================
 def http_fetch_page(url: str, page_idx: int) -> List[Product]:
     s = requests.Session()
     s.headers.update({
@@ -244,14 +257,14 @@ def http_fetch_page(url: str, page_idx: int) -> List[Product]:
             r.raise_for_status()
             return parse_http(r.text, page_idx)
         except Exception as e:
-            last_err=e; time.sleep(1.5*(attempt+1))
+            last_err=e; time.sleep(1.2*(attempt+1))
     if last_err: raise last_err
     return []
 
 def fetch_by_http() -> List[Product]:
     all_items: List[Product] = []
     for page_idx, urls in enumerate(PAGE_CANDIDATES):
-        got: List[Product] = []
+        got=[]
         for u in urls:
             try:
                 got = http_fetch_page(u, page_idx)
@@ -259,16 +272,16 @@ def fetch_by_http() -> List[Product]:
             except Exception:
                 continue
         all_items.extend(got)
-        time.sleep(random.uniform(0.8,1.5))
+        time.sleep(random.uniform(0.6,1.2))
     return all_items
 
-# ----------------- Playwright 폴백 -----------------
+# ==================== Playwright 수집 ====================
 def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     """
     Playwright 수집 (페이지별 50개)
-    - 기본: 후보 URL 직접 진입 → 스크롤 → JS로 카드 추출
-    - page_idx==0(1페이지)에서 부족하면 reload 재시도
-    - page_idx==1(2페이지)에서 부족하면: 1페이지 진입 → Next 클릭 시도 → 실패 시 href 추출 후 직접 이동
+    - 기본: 후보 URL → 스크롤(강화) → JS 추출
+    - page_idx==0 부족: reload 재시도
+    - page_idx==1 부족: 1페이지 → Next 클릭 → 실패 시 href 직접 이동
     """
     from playwright.sync_api import sync_playwright
 
@@ -318,7 +331,7 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
       const visitStore=/Visit the\\s+(.+?)\\s+Store/i;
 
       let cards=[]; for(const s of sels){ cards = cards.concat(Array.from(document.querySelectorAll(s))); }
-      if(cards.length < 30){
+      if(cards.length < 60){
         const anchors = Array.from(document.querySelectorAll("a[href*='/dp/']"));
         for(const el of anchors){ cards.push(el.closest('li')||el.closest('[data-asin]')||el.closest('div')||el); }
       }
@@ -397,43 +410,33 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"],
         )
         ctx = browser.new_context(
-            viewport={"width": 1366, "height": 900},
+            viewport={"width":1366,"height":900},
             locale="en-US",
             timezone_id="America/Los_Angeles",
             user_agent=random.choice(UA_POOL),
-            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,ko;q=0.6"},
+            extra_http_headers={"Accept-Language":"en-US,en;q=0.9,ko;q=0.6"},
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
 
-        # 1) 후보 URL로 직접 진입
+        # 1) 후보 URL로 진입
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=30_000)
-        except:
-            pass
+        try: page.wait_for_load_state("networkidle", timeout=30_000)
+        except: pass
 
-        # 쿠키/동의 모달 닫기
-        for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
-            try:
-                page.locator(sel).first.click(timeout=1200)
-            except:
-                pass
+        # 쿠키 배너 닫기
+        for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
+            try: page.locator(sel).first.click(timeout=1200)
+            except: pass
 
-        # 충분히 스크롤
-        for _ in range(24):
-            try:
-                page.mouse.wheel(0, 1600)
-            except:
-                pass
-            page.wait_for_timeout(600)
+        # 스크롤 (강화)
+        for _ in range(32):
+            try: page.mouse.wheel(0, 1600)
+            except: pass
+            page.wait_for_timeout(650)
 
         # 1차 평가
         try:
@@ -442,100 +445,80 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
             print("[Playwright] evaluate 1st try failed:", e)
             data = []
 
-        # page1도 부족하면 한 번 더 새로고침
+        # page1 부족 → reload 재시도
         if page_idx == 0 and (not isinstance(data, list) or len(data) < 45):
             try:
                 page.reload(wait_until="domcontentloaded", timeout=60_000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
-                except:
-                    pass
-                for _ in range(18):
-                    try:
-                        page.mouse.wheel(0, 1600)
-                    except:
-                        pass
-                    page.wait_for_timeout(400)
+                try: page.wait_for_load_state("networkidle", timeout=20_000)
+                except: pass
+                for _ in range(22):
+                    try: page.mouse.wheel(0, 1600)
+                    except: pass
+                    page.wait_for_timeout(500)
                 data = page.evaluate(js, page_idx)
             except Exception as e:
                 print("[Playwright] page1 reload fallback failed:", e)
 
-        # 2) 2페이지 부족 시: 1페이지 → Next 클릭 / href 직접 이동 폴백
+        # page2 부족 → 1페이지→Next 클릭 / href 이동
         if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
             try:
                 print("[Playwright] page2 부족 → Next-click / href-goto fallback")
-
-                # 1페이지로 먼저 진입
                 page.goto(PAGE_CANDIDATES[0][0], wait_until="domcontentloaded", timeout=60_000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
-                except:
-                    pass
+                try: page.wait_for_load_state("networkidle", timeout=20_000)
+                except: pass
+                for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
+                    try: page.locator(sel).first.click(timeout=1200)
+                    except: pass
+                for _ in range(8):
+                    try: page.mouse.wheel(0, 1400)
+                    except: pass
+                    page.wait_for_timeout(250)
 
-                for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
-                    try:
-                        page.locator(sel).first.click(timeout=1200)
-                    except:
-                        pass
-
-                # 페이지네이션 근처까지 스크롤
-                for _ in range(6):
-                    try:
-                        page.mouse.wheel(0, 1200)
-                    except:
-                        pass
-                    page.wait_for_timeout(200)
-
-                # 1차: Next 클릭
-                clicked = False
+                clicked=False
                 for sel in [
-                    "a[href*='?pg=2']",
-                    "a[href*='pg=2']",
-                    "a[aria-label*='Next']",
-                    "a[aria-label='Next page']",
-                    "a[aria-label='Go to next page']",
-                    "li.a-last a",
-                    "a.s-pagination-next",
+                    "a[href*='?pg=2']","a[href*='pg=2']",
+                    "a[aria-label*='Next']","a[aria-label='Next page']",
+                    "a[aria-label='Go to next page']","li.a-last a","a.s-pagination-next"
                 ]:
                     try:
                         page.locator(sel).first.click(timeout=4000, force=True)
-                        clicked = True
-                        break
-                    except:
-                        pass
+                        clicked=True; break
+                    except: pass
 
-                # 2차: href 추출 후 직접 이동
                 if not clicked:
                     try:
                         page2_href = page.evaluate("""
                         () => {
-                          const toAbs = (h) => h && (h.startsWith('/') ? 'https://www.amazon.com' + h : h);
+                          const toAbs = (h) => h && (h.startsWith('/') ? 'https://www.amazon.com'+h : h);
                           const as = Array.from(document.querySelectorAll('a[href]'));
-                          let a = as.find(x => /[?&]pg=2/.test(x.getAttribute('href') || '') &&
-                                               /(zgbs\\/beauty|bestsellers\\/beauty|\\/gp\\/bestsellers\\/beauty)/i.test(x.getAttribute('href') || ''));
-                          if (!a) a = as.find(x => /Next/i.test((x.textContent || '').trim()) && x.getAttribute('href'));
+                          let a = as.find(x => /[?&]pg=2/.test(x.getAttribute('href')||'') &&
+                                               /(zgbs\\/beauty|bestsellers\\/beauty|\\/gp\\/bestsellers\\/beauty)/i.test(x.getAttribute('href')||''));
+                          if(!a) a = as.find(x => /Next/i.test((x.textContent||'').trim()) && x.getAttribute('href'));
                           return a ? toAbs(a.getAttribute('href')) : null;
                         }
                         """)
                         if page2_href:
                             page.goto(page2_href, wait_until="domcontentloaded", timeout=60_000)
-                            try:
-                                page.wait_for_load_state("networkidle", timeout=20_000)
-                            except:
-                                pass
-                            clicked = True
+                            try: page.wait_for_load_state("networkidle", timeout=20_000)
+                            except: pass
+                            clicked=True
                     except Exception as e:
                         print("[Playwright] href-goto fallback failed:", e)
 
                 if clicked:
-                    for _ in range(22):
-                        try:
-                            page.mouse.wheel(0, 1600)
-                        except:
-                            pass
-                        page.wait_for_timeout(350)
+                    for _ in range(28):
+                        try: page.mouse.wheel(0, 1600)
+                        except: pass
+                        page.wait_for_timeout(500)
                     try:
                         data = page.evaluate(js, page_idx)
+                        if len(data) < 45:
+                            page.wait_for_timeout(1500)
+                            for _ in range(6):
+                                try: page.mouse.wheel(0, 1800)
+                                except: pass
+                                page.wait_for_timeout(400)
+                            data = page.evaluate(js, page_idx)
                     except Exception as e:
                         print("[Playwright] evaluate after goto/next failed:", e)
                         data = []
@@ -544,14 +527,13 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
             except Exception as e:
                 print("[Playwright] page2 fallback block failed:", e)
 
-        ctx.close()
-        browser.close()
+        ctx.close(); browser.close()
 
-    out: List[Product] = []
+    out=[]
     for r in (data or []):
         out.append(Product(
             rank=int(r["rank"]),
-            brand=clean_text(r.get("brand", "")),
+            brand=clean_text(r.get("brand","")),
             title=clean_text(r["title"]),
             price=r["price"],
             orig_price=r["orig_price"],
@@ -562,18 +544,17 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     return out
 
 def fetch_by_playwright() -> List[Product]:
-    all_items: List[Product] = []
+    all_items=[]
     for page_idx, urls in enumerate(PAGE_CANDIDATES):
-        got: List[Product] = []
+        got=[]
         for u in urls:
             got = fetch_page_playwright(u, page_idx)
-            if len(got) >= 48:
-                break
+            if len(got) >= 48: break
         all_items.extend(got)
-        time.sleep(0.8)
+        time.sleep(0.7)
     return all_items
 
-# ----------------- 통합 수집 + 재시도 -----------------
+# ==================== 통합 수집/병합 ====================
 def merge_by_rank(*lists: List[Product]) -> List[Product]:
     by_rank: Dict[int, Product] = {}
     for L in lists:
@@ -586,33 +567,29 @@ def merge_by_rank(*lists: List[Product]) -> List[Product]:
     return out
 
 def fetch_products() -> List[Product]:
-    # 1) HTTP 시도
+    # 1) HTTP
     try:
         items_http = fetch_by_http()
-        if len(items_http) >= 96:
-            items = items_http
-        else:
-            raise RuntimeError("HTTP 수집 부족")
+        items = items_http if len(items_http) >= 96 else []
+        if not items: raise RuntimeError("HTTP 수집 부족")
     except Exception as e:
-        print("[HTTP 오류] → Playwright 폴백:", e)
-        items = []
+        print("[HTTP 오류] → Playwright 폴백:", e); items=[]
 
-    # 2) Playwright (필요 시)
+    # 2) Playwright 보강
     if len(items) < 96:
         items_pw = fetch_by_playwright()
         items = merge_by_rank(items, items_pw)
 
-    # 3) 여전히 100 미만이면 한 번 더 Playwright 재시도
+    # 3) 여전히 100 미만이면 한 번 더 Playwright
     if len(items) < 100:
         print("[재시도] Playwright 한 번 더 실행")
         time.sleep(1.0)
         items_pw2 = fetch_by_playwright()
         items = merge_by_rank(items, items_pw2)
 
-    # 최종 1~100만 정렬
     return merge_by_rank(items)
 
-# ----------------- Drive -----------------
+# ==================== Google Drive ====================
 def normalize_folder_id(raw: str) -> str:
     if not raw: return ""
     s = raw.strip()
@@ -658,7 +635,7 @@ def drive_download_csv(service, folder_id: str, name: str) -> Optional[pd.DataFr
     while not done: _,done=dl.next_chunk()
     fh.seek(0); return pd.read_csv(fh)
 
-# ----------------- Slack -----------------
+# ==================== Slack ====================
 def slack_post(text: str):
     import requests as _r
     url=os.getenv("SLACK_WEBHOOK_URL")
@@ -675,55 +652,43 @@ def to_dataframe(products: List[Product], date_str: str) -> pd.DataFrame:
         "url": p.url, "asin": p.asin,
     } for p in products], columns=cols)
 
-# ----------------- Slack 섹션/메시지 -----------------
 def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> Dict[str, List[str]]:
     """
-    Slack 섹션 구성:
-    - TOP10: 전일 대비 (↑n)/(↓n)/(-)/(new) 표시
-    - 급상승/급하락: 1~100 전체 비교, '변동 10계단 이상'만, 각 최대 5개
-    - OUT: 전일 1~70에 있던 항목 중 오늘 OUT, 전일 순위 오름차순으로 최대 5개
-    - 뉴랭커: 상위 30 진입 최대 3개(유지)
+    - TOP10: 전일 대비 (↑n)/(↓n)/(-)/(new)
+    - 급상승/급하락: Top100 전체, 변동폭 10계단 이상, 각 5개
+    - OUT: 전일 1~70 → OUT, 전일 순위 오름차순 5개
+    - 뉴랭커: 30위 이내 진입 3개
     """
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
-    if df_today is None or "rank" not in df_today.columns or df_today.empty:
-        return S
+    if df_today is None or "rank" not in df_today.columns or df_today.empty: return S
 
-    # 전일 rank 조회용 맵 (키: ASIN 우선, 없으면 URL)
-    prev_rank_map: Dict[str, int] = {}
+    # 전일 rank 맵
+    prev_rank_map={}
     if df_prev is not None and "rank" in df_prev.columns and len(df_prev):
         df_p = df_prev.copy()
         df_p["key"] = df_p.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
-        for _, row in df_p[["key", "rank"]].dropna().iterrows():
+        for _, row in df_p[["key","rank"]].dropna().iterrows():
             try: prev_rank_map[str(row["key"])] = int(row["rank"])
             except: pass
 
-    # ===== TOP10 (전일 대비 등락) =====
+    # TOP10
     top10 = df_today.dropna(subset=["rank"]).sort_values("rank").head(10)
     for _, r in top10.iterrows():
         cur_rank = int(r["rank"])
         key = (str(r.get("asin")).strip() or str(r.get("url")).strip())
         prev_rank = prev_rank_map.get(key)
-
-        if prev_rank is None: badge = "(new)"
-        elif prev_rank > cur_rank: badge = f"(↑{prev_rank - cur_rank})"
-        elif prev_rank < cur_rank: badge = f"(↓{cur_rank - prev_rank})"
-        else: badge = "(-)"
-
-        name = clean_text(r["product_name"])
-        br = clean_text(r.get("brand", ""))
+        if prev_rank is None: badge="(new)"
+        elif prev_rank > cur_rank: badge=f"(↑{prev_rank-cur_rank})"
+        elif prev_rank < cur_rank: badge=f"(↓{cur_rank-prev_rank})"
+        else: badge="(-)"
+        name = clean_text(r["product_name"]); br = clean_text(r.get("brand",""))
         name_show = f"{br} {name}" if br and not name.lower().startswith(br.lower()) else name
-        name_link = f"<{r['url']}|{slack_escape(name_show)}>"
-
         price_txt = fmt_currency_usd(r["price"])
-        dc = r.get("discount_percent")
-        dc_tail = f" (↓{int(dc)}%)" if pd.notnull(dc) else ""
+        dc = r.get("discount_percent"); dc_tail = f" (↓{int(dc)}%)" if pd.notnull(dc) else ""
+        S["top10"].append(f"{cur_rank}. {badge} <{r['url']}|{slack_escape(name_show)}> — {price_txt}{dc_tail}")
 
-        S["top10"].append(f"{cur_rank}. {badge} {name_link} — {price_txt}{dc_tail}")
+    if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns: return S
 
-    if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns:
-        return S
-
-    # 1~100 전체 비교 준비
     df_t = df_today.copy()
     df_t = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 100)].copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
@@ -738,10 +703,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     new_all    = set(df_t.index) - set(df_p.index)
     out_all    = set(df_p.index) - set(df_t.index)
 
-    # 🔥 급상승 (Top100 전체, 10계단↑ 이상, 최대 5)
-    rising = []
+    # 급상승
+    rising=[]
     for k in common_all:
-        pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
+        pr, cr = int(df_p.loc[k,"rank"]), int(df_t.loc[k,"rank"])
         imp = pr - cr
         if imp >= 10:
             nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
@@ -749,10 +714,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     rising.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["rising"] = [x[-1] for x in rising[:5]]
 
-    # 📉 급하락 (Top100 전체, 10계단↓ 이상, 최대 5)
-    falling = []
+    # 급하락
+    falling=[]
     for k in common_all:
-        pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
+        pr, cr = int(df_p.loc[k,"rank"]), int(df_t.loc[k,"rank"])
         drop = cr - pr
         if drop >= 10:
             nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
@@ -760,22 +725,21 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
     S["falling"] = [x[-1] for x in falling[:5]]
 
-    # 🆕 뉴랭커 (상위 30 진입, 최대 3)
+    # 뉴랭커 (30위 이내)
     t30 = df_t[df_t["rank"] <= 30].copy()
     p30 = df_p[df_p["rank"] <= 30].copy()
-    new_30 = set(t30.index) - set(p30.index)
-    newcomers = []
-    for k in new_30:
-        cr = int(t30.loc[k, "rank"])
+    newcomers=[]
+    for k in (set(t30.index) - set(p30.index)):
+        cr = int(t30.loc[k,"rank"])
         nm = slack_escape(clean_text(t30.loc[k]["product_name"]))
         newcomers.append((cr, f"- <{t30.loc[k]['url']}|{nm}> NEW → {cr}위"))
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
-    # ❌ OUT (전일 1~70 → 오늘 OUT, 전일 순위 오름차순으로 최대 5개)
-    outs = []
+    # OUT (전일 1~70 → OUT)
+    outs=[]
     for k in out_all:
-        pr = int(df_p.loc[k, "rank"])
+        pr = int(df_p.loc[k,"rank"])
         if pr <= 70:
             nm = slack_escape(clean_text(df_p.loc[k]["product_name"]))
             outs.append((pr, f"- <{df_p.loc[k]['url']}|{nm}> {pr}위 → OUT"))
@@ -787,10 +751,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
     header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
-    if total_count < 100:
-        header += f"  _(수집 {total_count}/100)_"
-
-    lines: List[str] = [header, "", "*TOP 10*"]
+    if total_count < 100: header += f"  _(수집 {total_count}/100)_"
+    lines=[header,"","*TOP 10*"]
     lines.extend(S.get("top10") or ["- 데이터 없음"]); lines.append("")
     lines.append("*🔥 급상승*"); lines.extend(S.get("rising") or ["- 해당 없음"]); lines.append("")
     lines.append("*🆕 뉴랭커*"); lines.extend(S.get("newcomers") or ["- 해당 없음"]); lines.append("")
@@ -800,9 +762,11 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
 
-# ----------------- 메인 -----------------
+# ==================== 메인 ====================
 def main():
-    date_str=today_kst_str(); file_today=build_filename(date_str); file_yest=build_filename(yesterday_kst_str())
+    date_str=today_kst_str()
+    file_today=build_filename(date_str)
+    file_yest=build_filename(yesterday_kst_str())
 
     print("수집 시작: Amazon US Beauty & Personal Care")
     items=fetch_products()
@@ -813,7 +777,6 @@ def main():
     df_today.to_csv(os.path.join("data", file_today), index=False, encoding="utf-8-sig")
     print("로컬 저장:", file_today)
 
-    # Google Drive 업/다운
     folder=normalize_folder_id(os.getenv("GDRIVE_FOLDER_ID","")); df_prev=None
     if folder:
         try:
