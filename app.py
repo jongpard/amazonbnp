@@ -633,7 +633,8 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     """
     Slack 섹션 구성:
     - TOP10: 전일 대비 (↑n)/(↓n)/(-)/(new) 표시
-    - 급상승/뉴랭커/급하락/OUT 기존 로직 유지
+    - 급상승/급하락: 1~100 전체 비교, 각 최대 5개
+    - 뉴랭커/OUT/인&아웃: 기존 로직과 동일(뉴랭커는 30위 이내 3개 유지)
     """
     S = {"top10": [], "rising": [], "newcomers": [], "falling": [], "outs": [], "inout_count": 0}
 
@@ -658,10 +659,14 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
         key = (str(r.get("asin")).strip() or str(r.get("url")).strip())
         prev_rank = prev_rank_map.get(key)
 
-        if prev_rank is None: badge = "(new)"
-        elif prev_rank > cur_rank: badge = f"(↑{prev_rank - cur_rank})"
-        elif prev_rank < cur_rank: badge = f"(↓{cur_rank - prev_rank})"
-        else: badge = "(-)"
+        if prev_rank is None:
+            badge = "(new)"
+        elif prev_rank > cur_rank:
+            badge = f"(↑{prev_rank - cur_rank})"
+        elif prev_rank < cur_rank:
+            badge = f"(↓{cur_rank - prev_rank})"
+        else:
+            badge = "(-)"
 
         name = clean_text(r["product_name"])
         br = clean_text(r.get("brand", ""))
@@ -674,64 +679,67 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
 
         S["top10"].append(f"{cur_rank}. {badge} {name_link} — {price_txt}{dc_tail}")
 
-    # ===== 이하 기존 로직 =====
+    # ===== 전일 대비 비교용 전체(1~100) 데이터셋 준비 =====
     if df_prev is None or not len(df_prev) or "rank" not in df_prev.columns:
         return S
 
     df_t = df_today.copy()
+    df_t = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 100)].copy()
     df_t["key"] = df_t.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
     df_t.set_index("key", inplace=True)
 
     df_p = df_prev.copy()
+    df_p = df_p[(df_p["rank"].notna()) & (df_p["rank"] <= 100)].copy()
     df_p["key"] = df_p.apply(lambda x: (str(x.get("asin")).strip() or str(x.get("url")).strip()), axis=1)
     df_p.set_index("key", inplace=True)
 
-    t30 = df_t[(df_t["rank"].notna()) & (df_t["rank"] <= 30)].copy()
-    p30 = df_p[(df_p["rank"].notna()) & (df_p["rank"] <= 30)].copy()
+    common_all = set(df_t.index) & set(df_p.index)
+    new_all    = set(df_t.index) - set(df_p.index)
+    out_all    = set(df_p.index) - set(df_t.index)
 
-    common = set(t30.index) & set(p30.index)
-    new    = set(t30.index) - set(p30.index)
-    out    = set(p30.index) - set(t30.index)
-
-    # 급상승(3)
+    # 🔥 급상승 (전 구간 1~100, 최대 5개)
     rising = []
-    for k in common:
-        pr, cr = int(p30.loc[k, "rank"]), int(t30.loc[k, "rank"])
+    for k in common_all:
+        pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
         imp = pr - cr
         if imp > 0:
-            nm = slack_escape(clean_text(t30.loc[k]["product_name"]))
-            rising.append((imp, cr, pr, nm, f"- <{t30.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↑{imp})"))
+            nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
+            rising.append((imp, cr, pr, nm, f"- <{df_t.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↑{imp})"))
     rising.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-    S["rising"] = [x[-1] for x in rising[:3]]
+    S["rising"] = [x[-1] for x in rising[:5]]
 
-    # 뉴랭커(≤3)
+    # 📉 급하락 (전 구간 1~100, 최대 5개)
+    falling = []
+    for k in common_all:
+        pr, cr = int(df_p.loc[k, "rank"]), int(df_t.loc[k, "rank"])
+        drop = cr - pr
+        if drop > 0:
+            nm = slack_escape(clean_text(df_t.loc[k]["product_name"]))
+            falling.append((drop, cr, pr, nm, f"- <{df_t.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↓{drop})"))
+    falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+    S["falling"] = [x[-1] for x in falling[:5]]
+
+    # 🆕 뉴랭커 (기존과 동일: 상위 30에서 진입한 항목 최대 3개)
+    t30 = df_t[df_t["rank"] <= 30].copy()
+    p30 = df_p[df_p["rank"] <= 30].copy()
+    new_30 = set(t30.index) - set(p30.index)
     newcomers = []
-    for k in new:
+    for k in new_30:
         cr = int(t30.loc[k, "rank"])
         nm = slack_escape(clean_text(t30.loc[k]["product_name"]))
         newcomers.append((cr, f"- <{t30.loc[k]['url']}|{nm}> NEW → {cr}위"))
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
-    # 급하락(5)
-    falling = []
-    for k in common:
-        pr, cr = int(p30.loc[k, "rank"]), int(t30.loc[k, "rank"])
-        drop = cr - pr
-        if drop > 0:
-            nm = slack_escape(clean_text(t30.loc[k]["product_name"]))
-            falling.append((drop, cr, pr, nm, f"- <{t30.loc[k]['url']}|{nm}> {pr}위 → {cr}위 (↓{drop})"))
-    falling.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-    S["falling"] = [x[-1] for x in falling[:5]]
+    # OUT (전일 30위 이내 → OUT + 전일 100위 이내 → OUT 모두 포함)
+    for k in sorted(list(out_all)):
+        pr = int(df_p.loc[k, "rank"])
+        nm = slack_escape(clean_text(df_p.loc[k]["product_name"]))
+        S["outs"].append(f"- <{df_p.loc[k]['url']}|{nm}> {pr}위 → OUT")
 
-    # OUT
-    for k in sorted(list(out)):
-        pr = int(p30.loc[k, "rank"])
-        nm = slack_escape(clean_text(p30.loc[k]["product_name"]))
-        S["outs"].append(f"- <{p30.loc[k]['url']}|{nm}> {pr}위 → OUT")
-
-    S["inout_count"] = len(new) + len(out)
+    S["inout_count"] = len(new_all) + len(out_all)
     return S
+
 
 def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int) -> str:
     header = f"*Amazon US Beauty & Personal Care Top 100 — {date_str}*"
@@ -747,6 +755,7 @@ def build_slack_message(date_str: str, S: Dict[str, List[str]], total_count: int
     lines.append(""); lines.append("*🔄 랭크 인&아웃*")
     lines.append(f"{S.get('inout_count', 0)}개의 제품이 인&아웃 되었습니다.")
     return "\n".join(lines)
+
 
 # ----------------- 메인 -----------------
 def main():
