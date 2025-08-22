@@ -272,12 +272,24 @@ def fetch_by_http() -> List[Product]:
 
 # ----------------- Playwright 폴백 -----------------
 def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
+    """
+    Playwright 수집 (페이지별 50개)
+    - 기본: 후보 URL 직접 진입 → 스크롤 → JS로 카드 추출
+    - page_idx==0(1페이지)에서 부족하면 reload 재시도
+    - page_idx==1(2페이지)에서 부족하면: 1페이지 진입 → Next 클릭 시도 → 실패 시 href 추출 후 직접 이동
+    """
     from playwright.sync_api import sync_playwright
 
     js = """
     (pageIdx) => {
       function text(el){ return (el && (el.innerText||'').replace(/\\s+/g,' ').trim()) || ''; }
-      const sels = ["ol[id*='zg-ordered-list'] > li","[id*='gridItemRoot']","div.p13n-sc-uncoverable-faceout","div.zg-grid-general-faceout","[data-asin]"];
+      const sels = [
+        "ol[id*='zg-ordered-list'] > li",
+        "[id*='gridItemRoot']",
+        "div.p13n-sc-uncoverable-faceout",
+        "div.zg-grid-general-faceout",
+        "[data-asin]"
+      ];
       function uniq(nodes){ const s=new Set(), out=[]; nodes.forEach(n=>{ if(!s.has(n)){s.add(n); out.push(n);} }); return out; }
       function canonical(href, asin){
         if(!href && asin) return 'https://www.amazon.com/dp/'+asin;
@@ -393,14 +405,18 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         ctx = browser.new_context(
-            viewport={"width":1366,"height":900},
+            viewport={"width": 1366, "height": 900},
             locale="en-US",
             timezone_id="America/Los_Angeles",
             user_agent=random.choice(UA_POOL),
-            extra_http_headers={"Accept-Language":"en-US,en;q=0.9,ko;q=0.6"},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9,ko;q=0.6"},
         )
         ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         page = ctx.new_page()
@@ -413,7 +429,7 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
             pass
 
         # 쿠키/동의 모달 닫기
-        for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
+        for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
             try:
                 page.locator(sel).first.click(timeout=1200)
             except:
@@ -427,114 +443,115 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                 pass
             page.wait_for_timeout(600)
 
-        # JS 평가 (실패 시 빈 리스트로 두고 폴백 진행)
+        # 1차 평가
         try:
             data = page.evaluate(js, page_idx)
         except Exception as e:
             print("[Playwright] evaluate 1st try failed:", e)
             data = []
 
-        # page1도 부족하면 한 번 더 새로고침 후 재시도
+        # page1도 부족하면 한 번 더 새로고침
         if page_idx == 0 and (not isinstance(data, list) or len(data) < 45):
             try:
                 page.reload(wait_until="domcontentloaded", timeout=60_000)
-                try: page.wait_for_load_state("networkidle", timeout=20_000)
-                except: pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except:
+                    pass
                 for _ in range(18):
-                    try: page.mouse.wheel(0, 1600)
-                    except: pass
+                    try:
+                        page.mouse.wheel(0, 1600)
+                    except:
+                        pass
                     page.wait_for_timeout(400)
                 data = page.evaluate(js, page_idx)
             except Exception as e:
                 print("[Playwright] page1 reload fallback failed:", e)
 
-        # 2) 2페이지가 비거나 부족하면: 1페이지 → Next 클릭 / href 직접 진입 폴백
-if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
-    try:
-        print("[Playwright] page2 부족 → Next-click / href-goto fallback")
-
-        # 1페이지로 먼저 진입
-        page.goto(PAGE_CANDIDATES[0][0], wait_until="domcontentloaded", timeout=60_000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=20_000)
-        except:
-            pass
-
-        # 쿠키/동의 모달 닫기
-        for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
+        # 2) 2페이지 부족 시: 1페이지 → Next 클릭 / href 직접 이동 폴백
+        if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
             try:
-                page.locator(sel).first.click(timeout=1200)
-            except:
-                pass
+                print("[Playwright] page2 부족 → Next-click / href-goto fallback")
 
-        # 페이지네이션 영역 근처까지 약간 스크롤
-        for _ in range(6):
-            try:
-                page.mouse.wheel(0, 1200)
-            except:
-                pass
-            page.wait_for_timeout(200)
-
-        # 1차 시도: Next 클릭 (여러 셀렉터)
-        clicked = False
-        for sel in [
-            "a[href*='?pg=2']",
-            "a[href*='pg=2']",
-            "a[aria-label*='Next']",
-            "a[aria-label='Next page']",
-            "a[aria-label='Go to next page']",
-            "li.a-last a",
-            "a.s-pagination-next"
-        ]:
-            try:
-                page.locator(sel).first.click(timeout=4000, force=True)
-                clicked = True
-                break
-            except:
-                pass
-
-        # 2차 시도: href 추출 후 직접 이동
-        if not clicked:
-            try:
-                page2_href = page.evaluate("""
-                () => {
-                  const toAbs = (h) => h && (h.startsWith('/') ? 'https://www.amazon.com' + h : h);
-                  const as = Array.from(document.querySelectorAll('a[href]'));
-                  // pg=2 들어간 베스트셀러 2페이지 링크 우선
-                  let a = as.find(x => /[?&]pg=2/.test(x.getAttribute('href') || '') &&
-                                       /(zgbs\\/beauty|bestsellers\\/beauty|\\/gp\\/bestsellers\\/beauty)/i.test(x.getAttribute('href') || ''));
-                  if (!a) a = as.find(x => /Next/i.test((x.textContent || '').trim()) && x.getAttribute('href'));
-                  return a ? toAbs(a.getAttribute('href')) : null;
-                }
-                """)
-                if page2_href:
-                    page.goto(page2_href, wait_until="domcontentloaded", timeout=60_000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=20_000)
-                    except:
-                        pass
-                    clicked = True
-            except Exception as e:
-                print("[Playwright] href-goto fallback failed:", e)
-
-        if clicked:
-            # 레이지로드 강제 스크롤 후 재수집
-            for _ in range(22):
+                # 1페이지로 먼저 진입
+                page.goto(PAGE_CANDIDATES[0][0], wait_until="domcontentloaded", timeout=60_000)
                 try:
-                    page.mouse.wheel(0, 1600)
+                    page.wait_for_load_state("networkidle", timeout=20_000)
                 except:
                     pass
-                page.wait_for_timeout(350)
-            try:
-                data = page.evaluate(js, page_idx)
-            except Exception as e:
-                print("[Playwright] evaluate after goto/next failed:", e)
-                data = []
-        else:
-            print("[Playwright] Next 클릭/이동 폴백 모두 실패")
-    except Exception as e:
-        print("[Playwright] page2 fallback block failed:", e)
 
+                for sel in ["#sp-cc-accept", "button[name='accept']", "input#sp-cc-accept", "button:has-text('Accept')"]:
+                    try:
+                        page.locator(sel).first.click(timeout=1200)
+                    except:
+                        pass
+
+                # 페이지네이션 근처까지 스크롤
+                for _ in range(6):
+                    try:
+                        page.mouse.wheel(0, 1200)
+                    except:
+                        pass
+                    page.wait_for_timeout(200)
+
+                # 1차: Next 클릭
+                clicked = False
+                for sel in [
+                    "a[href*='?pg=2']",
+                    "a[href*='pg=2']",
+                    "a[aria-label*='Next']",
+                    "a[aria-label='Next page']",
+                    "a[aria-label='Go to next page']",
+                    "li.a-last a",
+                    "a.s-pagination-next",
+                ]:
+                    try:
+                        page.locator(sel).first.click(timeout=4000, force=True)
+                        clicked = True
+                        break
+                    except:
+                        pass
+
+                # 2차: href 추출 후 직접 이동
+                if not clicked:
+                    try:
+                        page2_href = page.evaluate("""
+                        () => {
+                          const toAbs = (h) => h && (h.startsWith('/') ? 'https://www.amazon.com' + h : h);
+                          const as = Array.from(document.querySelectorAll('a[href]'));
+                          let a = as.find(x => /[?&]pg=2/.test(x.getAttribute('href') || '') &&
+                                               /(zgbs\\/beauty|bestsellers\\/beauty|\\/gp\\/bestsellers\\/beauty)/i.test(x.getAttribute('href') || ''));
+                          if (!a) a = as.find(x => /Next/i.test((x.textContent || '').trim()) && x.getAttribute('href'));
+                          return a ? toAbs(a.getAttribute('href')) : null;
+                        }
+                        """)
+                        if page2_href:
+                            page.goto(page2_href, wait_until="domcontentloaded", timeout=60_000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=20_000)
+                            except:
+                                pass
+                            clicked = True
+                    except Exception as e:
+                        print("[Playwright] href-goto fallback failed:", e)
+
+                if clicked:
+                    # 레이지로드 유도 후 재수집
+                    for _ in range(22):
+                        try:
+                            page.mouse.wheel(0, 1600)
+                        except:
+                            pass
+                        page.wait_for_timeout(350)
+                    try:
+                        data = page.evaluate(js, page_idx)
+                    except Exception as e:
+                        print("[Playwright] evaluate after goto/next failed:", e)
+                        data = []
+                else:
+                    print("[Playwright] Next 클릭/이동 폴백 모두 실패")
+            except Exception as e:
+                print("[Playwright] page2 fallback block failed:", e)
 
         ctx.close()
         browser.close()
@@ -543,7 +560,7 @@ if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
     for r in (data or []):
         out.append(Product(
             rank=int(r["rank"]),
-            brand=clean_text(r.get("brand","")),
+            brand=clean_text(r.get("brand", "")),
             title=clean_text(r["title"]),
             price=r["price"],
             orig_price=r["orig_price"],
