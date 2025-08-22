@@ -337,7 +337,7 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
         if(!brand){ const ws=title.split(' '); if(ws.length){ brand=(ws[0].length<=3 && ws[1]) ? (ws[0]+' '+ws[1]) : ws[0]; } }
 
         const blk=text(c);
-        const prices = Array.from(blk.matchAll(usdRe)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v=>!isNaN(v)&&v>0;
+        const prices = Array.from(blk.matchAll(usdRe)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v => !isNaN(v) && v > 0);
         let sale=null, orig=null; if(prices.length===1) sale=prices[0]; else if(prices.length>=2){ sale=Math.min(...prices); orig=Math.max(...prices); if(sale===orig) orig=null; }
 
         const row = {rank:null, brand, title, price:sale, orig_price:orig, url: canonical(a ? a.getAttribute('href') : '', asin), asin};
@@ -423,17 +423,33 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                         pass
 
                 if clicked:
-                    try: page.wait_for_load_state("networkidle", timeout=20_000)
-                    except: pass
-                    for _ in range(18):
-                        try: page.mouse.wheel(0, 1600)
-                        except: pass
-                        page.wait_for_timeout(400)
-                    data = page.evaluate(js, page_idx)
-                else:
-                    print("[Playwright] Next 클릭 셀렉터 매칭 실패")
-            except Exception as e:
-                print("[Playwright] Next-click fallback 실패:", e)
+    # 2페이지 로딩 대기
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except:
+        pass
+
+    # 조금 더 내려서 레이지로드 강제
+    try:
+        for _ in range(18):
+            try:
+                page.mouse.wheel(0, 1600)
+            except:
+                pass
+            page.wait_for_timeout(400)
+    except:
+        pass
+
+    # JS 평가 (실패 시 빈 리스트로 처리해 상위 로직 계속 진행)
+    try:
+        data = page.evaluate(js, page_idx)
+    except Exception as e:
+        print("[Playwright] evaluate after Next click failed:", e)
+        data = []
+else:
+    print("[Playwright] Next 클릭 셀렉터 매칭 실패")
+except Exception as e:
+    print("[Playwright] Next-click fallback 실패:", e)
 
         ctx.close(); browser.close()
 
