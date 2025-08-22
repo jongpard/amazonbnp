@@ -239,43 +239,9 @@ def parse_http(html: str, page_idx: int) -> List[Product]:
     return out
 
 # ----------------- HTTP 수집 -----------------
-def http_fetch_page(url: str, page_idx: int) -> List[Product]:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": random.choice(UA_POOL),
-        "Accept-Language": "en-US,en;q=0.9,ko;q=0.6",
-        "Cache-Control": "no-cache", "Pragma": "no-cache", "DNT": "1",
-        "Upgrade-Insecure-Requests": "1",
-    })
-    last_err=None
-    for attempt in range(3):
-        try:
-            r = s.get(url, timeout=25)
-            if r.status_code==429: raise requests.HTTPError("429 Too Many Requests")
-            r.raise_for_status()
-            return parse_http(r.text, page_idx)
-        except Exception as e:
-            last_err=e; time.sleep(1.5*(attempt+1))
-    if last_err: raise last_err
-    return []
-
-def fetch_by_http() -> List[Product]:
-    all_items: List[Product] = []
-    for page_idx, urls in enumerate(PAGE_CANDIDATES):
-        got: List[Product] = []
-        for u in urls:
-            try:
-                got = http_fetch_page(u, page_idx)
-                if len(got) >= 48: break
-            except Exception: 
-                continue
-        all_items.extend(got)
-        time.sleep(random.uniform(0.8,1.5))
-    return all_items
-
-# ----------------- Playwright 폴백 -----------------
 def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
     from playwright.sync_api import sync_playwright
+
     js = """
     (pageIdx) => {
       function text(el){ return (el && (el.innerText||'').replace(/\\s+/g,' ').trim()) || ''; }
@@ -294,7 +260,11 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
         let p=node.parentElement;
         for(let i=0;i<2 && p;i++){ const v=g(p); if(v) return v.trim(); p=p.parentElement; }
         const links=node.querySelectorAll? node.querySelectorAll('a[href]'):[];
-        for(const l of links){ const h=l.getAttribute('href')||''; let m=h.match(/\\/dp\\/([A-Z0-9]{10})/)||h.match(/[?&](?:pd_rd_i|asin|ASIN|m)=([A-Z0-9]{10})/)||h.match(/(?:dp%2F|asin%2F)([A-Z0-9]{10})/); if(m) return m[1]; }
+        for(const l of links){
+          const h=l.getAttribute('href')||'';
+          let m=h.match(/\\/dp\\/([A-Z0-9]{10})/)||h.match(/[?&](?:pd_rd_i|asin|ASIN|m)=([A-Z0-9]{10})/)||h.match(/(?:dp%2F|asin%2F)([A-Z0-9]{10})/);
+          if(m) return m[1];
+        }
         return '';
       }
       function extractRank(node){
@@ -312,8 +282,12 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
       const visitStore=/Visit the\\s+(.+?)\\s+Store/i;
 
       let cards=[]; for(const s of sels){ cards = cards.concat(Array.from(document.querySelectorAll(s))); }
-      if(cards.length < 30){ const anchors = Array.from(document.querySelectorAll("a[href*='/dp/']")); for(const el of anchors){ cards.push(el.closest('li')||el.closest('[data-asin]')||el.closest('div')||el); } }
+      if(cards.length < 30){
+        const anchors = Array.from(document.querySelectorAll("a[href*='/dp/']"));
+        for(const el of anchors){ cards.push(el.closest('li')||el.closest('[data-asin]')||el.closest('div')||el); }
+      }
       cards = uniq(cards);
+
       const map = new Map(); // rank_in_page -> product
       const extras = [];
       const seen = new Set();
@@ -325,20 +299,47 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
 
         const a = c.querySelector("a[href*='/dp/']") || c.querySelector("a.a-link-normal[href]");
         let title = a ? (a.getAttribute('aria-label') || a.getAttribute('title') || text(a)) : '';
-        if(!title){ const img=c.querySelector('img[alt]'); if(img) title=(img.getAttribute('alt')||'').replace(/\\s+/g,' ').trim(); }
-        if(!title){ const t=c.querySelector('span.a-size-medium, span.a-size-base, span.p13n-sc-truncated'); if(t) title=text(t); }
+        if(!title){
+          const img=c.querySelector('img[alt]');
+          if(img) title=(img.getAttribute('alt')||'').replace(/\\s+/g,' ').trim();
+        }
+        if(!title){
+          const t=c.querySelector('span.a-size-medium, span.a-size-base, span.p13n-sc-truncated');
+          if(t) title=text(t);
+        }
         if(!title) continue;
 
         // brand
         let brand='';
         const storeA = c.querySelector("a[href*='/stores/']:not([href*='/dp/'])");
-        if(storeA){ const bt=text(storeA); const m=bt.match(visitStore); brand = m? m[1].trim() : (!/^(sponsored|see more)$/i.test(bt) ? bt.trim() : ''); }
-        if(!brand){ const blk=text(c); let m=blk.match(brandLabel); if(m) brand=(m[1]||'').trim(); else { m=blk.match(byBrandRe); if(m) brand=(m[1]||'').trim(); } }
-        if(!brand){ const ws=title.split(' '); if(ws.length){ brand=(ws[0].length<=3 && ws[1]) ? (ws[0]+' '+ws[1]) : ws[0]; } }
+        if(storeA){
+          const bt=text(storeA);
+          const m=bt.match(visitStore);
+          brand = m? m[1].trim() : (!/^(sponsored|see more)$/i.test(bt) ? bt.trim() : '');
+        }
+        if(!brand){
+          const blk=text(c);
+          let m=blk.match(brandLabel);
+          if(m) brand=(m[1]||'').trim();
+          else { m=blk.match(byBrandRe); if(m) brand=(m[1]||'').trim(); }
+        }
+        if(!brand){
+          const ws=title.split(' ');
+          if(ws.length){
+            brand=(ws[0].length<=3 && ws[1]) ? (ws[0]+' '+ws[1]) : ws[0];
+          }
+        }
 
         const blk=text(c);
-        const prices = Array.from(blk.matchAll(usdRe)).map(m=>parseFloat(m[1].replace(/,/g,''))).filter(v => !isNaN(v) && v > 0);
-        let sale=null, orig=null; if(prices.length===1) sale=prices[0]; else if(prices.length>=2){ sale=Math.min(...prices); orig=Math.max(...prices); if(sale===orig) orig=null; }
+        const prices = Array.from(blk.matchAll(usdRe))
+          .map(m => parseFloat(m[1].replace(/,/g,'')))
+          .filter(v => !isNaN(v) && v > 0);
+        let sale=null, orig=null;
+        if(prices.length===1) sale=prices[0];
+        else if(prices.length>=2){
+          sale=Math.min(...prices); orig=Math.max(...prices);
+          if(sale===orig) orig=null;
+        }
 
         const row = {rank:null, brand, title, price:sale, orig_price:orig, url: canonical(a ? a.getAttribute('href') : '', asin), asin};
 
@@ -356,6 +357,7 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
       return out;
     }
     """
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -363,7 +365,8 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
         )
         ctx = browser.new_context(
             viewport={"width":1366,"height":900},
-            locale="en-US", timezone_id="America/Los_Angeles",
+            locale="en-US",
+            timezone_id="America/Los_Angeles",
             user_agent=random.choice(UA_POOL),
             extra_http_headers={"Accept-Language":"en-US,en;q=0.9,ko;q=0.6"},
         )
@@ -372,21 +375,32 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
 
         # 1) 후보 URL로 직접 진입
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-        try: page.wait_for_load_state("networkidle", timeout=30_000)
-        except: pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=30_000)
+        except:
+            pass
 
         # 쿠키/동의 모달 닫기
         for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
-            try: page.locator(sel).first.click(timeout=1200)
-            except: pass
+            try:
+                page.locator(sel).first.click(timeout=1200)
+            except:
+                pass
 
         # 충분히 스크롤
         for _ in range(24):
-            try: page.mouse.wheel(0, 1600)
-            except: pass
+            try:
+                page.mouse.wheel(0, 1600)
+            except:
+                pass
             page.wait_for_timeout(600)
 
-        data = page.evaluate(js, page_idx)
+        # JS 평가 (실패 시 빈 리스트로 두고 폴백 진행)
+        try:
+            data = page.evaluate(js, page_idx)
+        except Exception as e:
+            print("[Playwright] evaluate 1st try failed:", e)
+            data = []
 
         # 2) 2페이지가 비거나 부족하면: 1페이지 → Next 클릭 폴백
         if page_idx == 1 and (not isinstance(data, list) or len(data) < 45):
@@ -394,17 +408,23 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                 print("[Playwright] page2 부족 → Next-click fallback")
                 # 1페이지로 먼저 진입
                 page.goto(PAGE_CANDIDATES[0][0], wait_until="domcontentloaded", timeout=60_000)
-                try: page.wait_for_load_state("networkidle", timeout=20_000)
-                except: pass
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20_000)
+                except:
+                    pass
 
                 for sel in ["#sp-cc-accept","button[name='accept']","input#sp-cc-accept","button:has-text('Accept')"]:
-                    try: page.locator(sel).first.click(timeout=1200)
-                    except: pass
+                    try:
+                        page.locator(sel).first.click(timeout=1200)
+                    except:
+                        pass
 
                 # 페이지네이션 근처로 한번 내려줌
                 for _ in range(6):
-                    try: page.mouse.wheel(0, 1200)
-                    except: pass
+                    try:
+                        page.mouse.wheel(0, 1200)
+                    except:
+                        pass
                     page.wait_for_timeout(200)
 
                 clicked = False
@@ -423,7 +443,6 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                         pass
 
                 if clicked:
-                    # 2페이지 로딩 대기
                     try:
                         page.wait_for_load_state("networkidle", timeout=20_000)
                     except:
@@ -440,7 +459,6 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                     except:
                         pass
 
-                    # JS 평가 (실패 시 빈 리스트로 처리해 상위 로직 계속 진행)
                     try:
                         data = page.evaluate(js, page_idx)
                     except Exception as e:
@@ -448,18 +466,23 @@ def fetch_page_playwright(url: str, page_idx: int) -> List[Product]:
                         data = []
                 else:
                     print("[Playwright] Next 클릭 셀렉터 매칭 실패")
-                except Exception as e:
-                    print("[Playwright] Next-click fallback 실패:", e)
+            except Exception as e:
+                print("[Playwright] Next-click fallback 실패:", e)
 
-        ctx.close(); browser.close()
+        ctx.close()
+        browser.close()
 
-    out=[]
-    for r in data:
+    out: List[Product] = []
+    for r in (data or []):
         out.append(Product(
-            rank=int(r["rank"]), brand=clean_text(r.get("brand","")),
-            title=clean_text(r["title"]), price=r["price"], orig_price=r["orig_price"],
+            rank=int(r["rank"]),
+            brand=clean_text(r.get("brand","")),
+            title=clean_text(r["title"]),
+            price=r["price"],
+            orig_price=r["orig_price"],
             discount_percent=discount_floor(r["orig_price"], r["price"]),
-            url=r["url"], asin=r["asin"]
+            url=r["url"],
+            asin=r["asin"],
         ))
     return out
 
