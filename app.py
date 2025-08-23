@@ -737,7 +737,7 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
     # OUT (전일 1~70 → OUT)
-    # k(ASIN 또는 URL) → rank 매핑 준비
+    # k(ASIN 또는 URL) → rank 매핑 (안전용 폴백)
     if "asin" in df_prev.columns:
         prev_rank_map = pd.Series(
             df_prev["rank"].values,
@@ -752,11 +752,24 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     outs = []
     for k in out_all:
         ks = str(k).strip()
-        # df_p_loc에 있으면 거기서, 아니면 prev_rank_map에서 랭크 조회
-        pr = int(df_p_loc.get(ks, {}).get("rank", prev_rank_map.get(ks, 9999)))
+
+        # 전일 rank (df_p에 있으면 우선 사용, 없으면 폴백 맵)
+        if ks in df_p.index:
+            try:
+                pr = int(df_p.at[ks, "rank"])
+            except Exception:
+                pr = int(prev_rank_map.get(ks, 9999))
+        else:
+            pr = int(prev_rank_map.get(ks, 9999))
+
         if pr <= 70:
-            nm = slack_escape(clean_text(df_p_loc.get(ks, {}).get("product_name", "")))
-            url = df_p_loc.get(ks, {}).get("url", "")
+            # 전일 상품명/URL
+            if ks in df_p.index:
+                nm  = slack_escape(clean_text(str(df_p.at[ks, "product_name"])))
+                url = str(df_p.at[ks, "url"])
+            else:
+                nm, url = "", ""
+
             outs.append((pr, f"<{url}|{nm}> {pr}위 → OUT"))
 
     outs.sort(key=lambda x: x[0])
