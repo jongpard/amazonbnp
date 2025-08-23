@@ -736,10 +736,10 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     newcomers.sort(key=lambda x: x[0])
     S["newcomers"] = [x[1] for x in newcomers[:3]]
 
-   # OUT (전일 1~70 → OUT)
+    # OUT (전일 1~70 → OUT)
     outs = []
     for k in out_all:
-        pr = int(df_p.loc[k, "rank"])
+        pr = int(df_prev.loc[k, "rank"])
         if pr <= 70:
             nm = slack_escape(clean_text(df_p_loc[k]["product_name"]))
             outs.append((pr, f"<{df_p_loc[k]['url']}|{nm}> {pr}위 → OUT"))
@@ -747,20 +747,20 @@ def build_sections(df_today: pd.DataFrame, df_prev: Optional[pd.DataFrame]) -> D
     S["outs"] = [x[1] for x in outs[:5]]
 
     # 인&아웃 수 = Top100 교체 수(대칭차집합/2)
-    if "asin" in df.columns and "asin" in df_p.columns:
+    if "asin" in df_today.columns and "asin" in df_prev.columns:
         today_keys = set(
-            df.sort_values("rank").head(100)["asin"].astype(str).str.strip()
+            df_today.sort_values("rank").head(100)["asin"].astype(str).str.strip()
         )
         prev_keys = set(
-            df_p[df_p["rank"].between(1, 100)]["asin"].astype(str).str.strip()
+            df_prev[df_prev["rank"].between(1, 100)]["asin"].astype(str).str.strip()
         )
     else:
-        # asin이 누락된 경우 URL로 폴백
+        # asin이 없으면 URL로 폴백
         today_keys = set(
-            df.sort_values("rank").head(100)["url"].astype(str).str.strip()
+            df_today.sort_values("rank").head(100)["url"].astype(str).str.strip()
         )
         prev_keys = set(
-            df_p[df_p["rank"].between(1, 100)]["url"].astype(str).str.strip()
+            df_prev[df_prev["rank"].between(1, 100)]["url"].astype(str).str.strip()
         )
 
     S["inout_count"] = len(today_keys ^ prev_keys) // 2
