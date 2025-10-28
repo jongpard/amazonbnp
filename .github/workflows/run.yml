@@ -1,38 +1,61 @@
-name: amazon_us_beauty_rankings
+name: Amazon US Beauty Top100
 
 on:
   workflow_dispatch:
   schedule:
-    # KST 08:12 = UTC 23:12
+    # KST 08:12 ≒ UTC 23:12 (전일 데이터 안정화 후)
     - cron: "12 23 * * *"
+
+env:
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TZ: "Asia/Seoul"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install -U pip
-          pip install requests pandas beautifulsoup4 lxml pytz google-api-python-client google-auth-httplib2 google-auth-oauthlib playwright
-          python -m playwright install chromium --with-deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-      - name: Run crawler
+      - name: Install system deps (for Playwright)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnss3 libxss1 libasound2 fonts-liberation
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          # 핵심 라이브러리 + packaging(이번 오류의 원인)
+          pip install \
+            requests pandas beautifulsoup4 lxml \
+            google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib \
+            playwright packaging
+          # 크로미움 설치
+          python -m playwright install --with-deps chromium
+
+      - name: Run python app.py
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
           python app.py
 
@@ -40,5 +63,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: amazon-us-beauty-csv
-          path: data/*.csv
+          name: data-csv
+          path: |
+            data/*.csv
+          if-no-files-found: warn
+          retention-days: 7
