@@ -3,7 +3,7 @@ name: Amazon US Beauty Top100
 on:
   workflow_dispatch:
   schedule:
-    # KST 08:12 ≒ UTC 23:12 (전일 데이터 안정화 후)
+    # KST 08:30 ≒ UTC 23:30
     - cron: "12 23 * * *"
 
 env:
@@ -25,28 +25,23 @@ jobs:
         with:
           python-version: "3.10"
 
+      # (선택) pip 캐시 – requirements.txt가 없다면 생략해도 됩니다.
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('app.py') }}
           restore-keys: |
             ${{ runner.os }}-pip-
-
-      - name: Install system deps (for Playwright)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libnss3 libxss1 libasound2 fonts-liberation
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          # 핵심 라이브러리 + packaging(이번 오류의 원인)
           pip install \
             requests pandas beautifulsoup4 lxml \
             google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib \
             playwright packaging
-          # 크로미움 설치
+          # Playwright + Chromium 및 OS 의존성 자동 설치
           python -m playwright install --with-deps chromium
 
       - name: Run python app.py
@@ -64,7 +59,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: data-csv
-          path: |
-            data/*.csv
+          path: data/*.csv
           if-no-files-found: warn
           retention-days: 7
